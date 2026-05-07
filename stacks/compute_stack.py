@@ -209,6 +209,7 @@ class ComputeStack(Stack):
             memory_size=256,
             timeout=Duration.minutes(3),
             role=anomaly_role,
+            tracing=_lambda.Tracing.ACTIVE,
             environment={
                 "BASELINE_TABLE": self._baseline_table.table_name,
                 "ANOMALY_TABLE":  self._anomaly_table.table_name,

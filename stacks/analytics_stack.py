@@ -6,15 +6,20 @@ Resources:
   Glue Databases     : ott_search_gold
   Step Functions SM  : ott-daily-pipeline; trigger 01:30 UTC+7 (18:30 UTC)
     States:
-      StartCrawler → WaitCrawler → StartETL → WaitETL
+      StartCrawler → WaitCrawler → StartETL
+      → RepairCuratedTable (MSCK REPAIR — registers partitions Athena can see)
+      → DropGoldTable     (DROP TABLE IF EXISTS — makes CTAS idempotent)
       → RunAthenaGoldCTAS → InvokeBaselineUpdater
-      → Choice (Success | Failure)
-      [Success] → PublishSuccessMetric
-      [Failure] → PublishFailureAlert (SNS)
+      → PipelineSuccess / PipelineFailure
   Step Functions role : least-privilege (Glue, Athena, Lambda invoke, S3, CloudWatch)
 
 Gold CTAS query (§6.3):
   keyword_trends — top-50 per (derived_genre, platform_group), rank_delta vs 7d ago
+
+CDK context overrides (cdk.json or --context):
+  gold_date_filter   : Athena WHERE dt filter for CTAS and baseline updater.
+                       Default: "dt >= date_add('day', -1, current_date)"
+                       Demo:    "dt >= '2022-01-01'"
 
 Cross-stack inputs:
   bucket  ← StorageStack
@@ -72,7 +77,7 @@ WITH ranked_today AS (
       ORDER BY COUNT(*) FILTER (WHERE session_action = 'enter') DESC
     )                                                      AS rank_today
   FROM ott_search_curated.search_enriched
-  WHERE dt >= DATE_ADD('day', -1, CURRENT_DATE)
+  WHERE {date_filter}
     AND keyword_norm IS NOT NULL
     AND is_cross_partition_date = false
   GROUP BY 1, 2, 3, 4, 5, 6
@@ -125,6 +130,13 @@ class AnalyticsStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         bucket_name = bucket.bucket_name if bucket else "PLACEHOLDER"
+
+        # CDK context override: set to "dt >= '2022-01-01'" for demo / backfill runs.
+        # Production default is yesterday's partition.
+        _date_filter = (
+            self.node.try_get_context("gold_date_filter")
+            or "dt >= date_add('day', -1, current_date)"
+        )
 
         # ── Glue gold database ────────────────────────────────────────────────
         glue.CfnDatabase(
@@ -214,7 +226,7 @@ class AnalyticsStack(Stack):
         # transitions) are included.  from_chainable() only traverses CDK
         # .next() links and silently drops states referenced only by name in
         # CustomState JSON, causing MISSING_TRANSITION_TARGET validation errors.
-        gold_sql = _GOLD_CTAS_SQL.format(bucket=bucket_name)
+        gold_sql = _GOLD_CTAS_SQL.format(bucket=bucket_name, date_filter=_date_filter)
         _crawler = crawler_name or "raw-events-crawler"
         _job     = enrichment_job_name or "search-enrichment-job"
         _updater = baseline_updater_arn or "ott-baseline-updater"
@@ -255,7 +267,39 @@ class AnalyticsStack(Stack):
                 "StartETLJob": {
                     "Type": "Task",
                     "Resource": "arn:aws:states:::glue:startJobRun.sync",
-                    "Parameters": {"JobName": _job},
+                    "Parameters": {
+                        "JobName": _job,
+                        "Arguments": {"--PUSH_DOWN_PREDICATE": _date_filter},
+                    },
+                    "ResultPath": None,
+                    "Next": "RepairCuratedTable",
+                    "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailure"}],
+                },
+                "RepairCuratedTable": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                    "Parameters": {
+                        "QueryString": "MSCK REPAIR TABLE ott_search_curated.search_enriched",
+                        "WorkGroup": f"ott-analytics-{env_name}",
+                        "ResultConfiguration": {
+                            "OutputLocation": f"s3://{bucket_name}/athena-results/",
+                        },
+                    },
+                    "ResultPath": None,
+                    "Next": "DropGoldTable",
+                    "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailure"}],
+                },
+                "DropGoldTable": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                    "Parameters": {
+                        "QueryString": "DROP TABLE IF EXISTS ott_search_gold.keyword_trends",
+                        "WorkGroup": f"ott-analytics-{env_name}",
+                        "ResultConfiguration": {
+                            "OutputLocation": f"s3://{bucket_name}/athena-results/",
+                        },
+                    },
+                    "ResultPath": None,
                     "Next": "RunAthenaGoldCTAS",
                     "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailure"}],
                 },

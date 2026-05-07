@@ -74,6 +74,16 @@ def _parse_ts(dt_clean: str | None) -> float | None:
     return None
 
 
+_VN_OFFSET_SEC = 7 * 3600
+
+def _vn_hour(row: dict) -> int:
+    """Return Vietnam-timezone hour from a row's datetime field."""
+    ts = _parse_ts(_clean_dt(row.get("datetime")))
+    if ts is None:
+        return -1
+    return int(((ts + _VN_OFFSET_SEC) % 86400) // 3600)
+
+
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -143,12 +153,23 @@ def _put_batch(records: list[dict]) -> int:
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context: object) -> dict:
-    """Entry point — invoke manually to start the replay."""
+    """Entry point — invoke manually to start the replay.
+
+    Optional event fields for anomaly injection demo:
+      inject_anomaly    (bool)   : if true, duplicate records for anomaly_genre at anomaly_hour
+      anomaly_genre     (str)    : derived_genre to spike (default "THE_THAO")
+      anomaly_hour      (int)    : Vietnam-timezone hour to spike (default 20)
+      anomaly_multiplier(int)    : how many extra copies to inject (default 10)
+    """
+    inject         = event.get("inject_anomaly", False)
+    anomaly_genre  = event.get("anomaly_genre",  "THE_THAO")
+    anomaly_hour   = int(event.get("anomaly_hour", 20))
+    anomaly_mult   = int(event.get("anomaly_multiplier", 10))
+
     bucket, prefix = _parse_s3_uri(S3_PREFIX)
     keys = _list_parquet_keys(bucket, prefix)
     logger.info("Found %d parquet files under s3://%s/%s", len(keys), bucket, prefix)
 
-    # Collect all rows, find min timestamp for replay offset calculation
     all_rows: list[dict] = []
     for key in keys:
         rows = _read_parquet_from_s3(bucket, key)
@@ -156,7 +177,20 @@ def lambda_handler(event: dict, context: object) -> dict:
         all_rows.extend(enriched)
     logger.info("Total rows: %d", len(all_rows))
 
-    # Sort by original event timestamp for correct replay ordering
+    if inject:
+        spike_rows = [
+            r for r in all_rows
+            if r.get("derived_genre") == anomaly_genre
+            and _vn_hour(r) == anomaly_hour
+        ]
+        injected = spike_rows * (anomaly_mult - 1)
+        all_rows.extend(injected)
+        logger.info(
+            "Anomaly injection: %d spike rows × %d = %d extra records "
+            "(genre=%s hour=%d)",
+            len(spike_rows), anomaly_mult - 1, len(injected), anomaly_genre, anomaly_hour,
+        )
+
     def _ts(r: dict) -> float:
         return _parse_ts(_clean_dt(r.get("datetime"))) or 0.0
 
@@ -171,19 +205,17 @@ def lambda_handler(event: dict, context: object) -> dict:
     for batch_start in range(0, len(all_rows), _BATCH_SIZE):
         batch = all_rows[batch_start: batch_start + _BATCH_SIZE]
 
-        # Respect replay timeline — sleep until this batch's replay time
         last_row_ts = timestamps[min(batch_start + _BATCH_SIZE - 1, len(timestamps) - 1)]
         replay_ts   = now_epoch + (last_row_ts - min_ts) / SPEEDUP_FACTOR
         sleep_sec   = replay_ts - time.time()
         if sleep_sec > 0:
-            time.sleep(min(sleep_sec, 1.0))  # cap single sleep to avoid Lambda timeout
+            time.sleep(min(sleep_sec, 1.0))
 
         t0 = time.time()
         failed = _put_batch(batch)
         total_published += len(batch) - failed
         total_failed    += failed
 
-        # Rate-limit: hold ≥ _BATCH_SIZE/_MAX_REC_SEC between batch starts
         elapsed = time.time() - t0
         time.sleep(max(0, _BATCH_SIZE / _MAX_REC_SEC - elapsed))
 

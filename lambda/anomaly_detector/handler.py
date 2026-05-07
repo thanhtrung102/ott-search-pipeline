@@ -173,6 +173,7 @@ def lambda_handler(event: dict, context: object) -> None:
                 "Anomaly detected category=%s hour=%d count=%d z=%.2f id=%s",
                 category, hour, count, z_score, anomaly_id,
             )
+            anomaly_type = "SPIKE" if z_score > 0 else "DROP"
             _events.put_events(Entries=[{
                 "Source":     "ott.anomaly-detector",
                 "DetailType": "SearchAnomalyDetected",
@@ -181,6 +182,7 @@ def lambda_handler(event: dict, context: object) -> None:
                     "hour_of_day_vn": hour,
                     "observed_count": count,
                     "z_score":        z_score,
+                    "anomaly_type":   anomaly_type,
                     "anomaly_id":     anomaly_id,
                 }),
                 "EventBusName": EVENT_BUS_NAME,
