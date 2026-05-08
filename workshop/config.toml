@@ -1,0 +1,18 @@
+baseURL = "/"
+title = "OTT Search Pipeline Workshop"
+theme = "hugo-theme-relearn"
+
+[params]
+  themeVariant = "blue"
+  editURL = ""
+  showVisitedLinks = true
+  disableLandingPage = false
+  mermaid = { zoom = true }
+  [params.author]
+    name = "OTT Platform Analytics Team"
+
+[search]
+  disable = false
+
+[outputs]
+  home = ["HTML", "RSS", "JSON"]

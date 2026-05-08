@@ -47,7 +47,7 @@ _S3       = boto3.client("s3")
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 _BATCH_SIZE   = 500    # Kinesis PutRecords max
-_MAX_REC_SEC  = 1_500  # rate limit per spec §4.5
+_MAX_REC_SEC  = int(os.environ.get("MAX_REC_SEC", "1500"))  # rate limit per spec §4.5
 
 
 # ── Datetime helpers (§6.7) ───────────────────────────────────────────────────
@@ -166,7 +166,8 @@ def lambda_handler(event: dict, context: object) -> dict:
     anomaly_hour   = int(event.get("anomaly_hour", 20))
     anomaly_mult   = int(event.get("anomaly_multiplier", 10))
 
-    bucket, prefix = _parse_s3_uri(S3_PREFIX)
+    s3_prefix = event.get("s3_prefix", S3_PREFIX).rstrip("/")
+    bucket, prefix = _parse_s3_uri(s3_prefix)
     keys = _list_parquet_keys(bucket, prefix)
     logger.info("Found %d parquet files under s3://%s/%s", len(keys), bucket, prefix)
 

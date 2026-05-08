@@ -58,12 +58,72 @@ class GovernanceStack(Stack):
         bucket_name = bucket.bucket_name if bucket else "PLACEHOLDER"
 
         # ── IAM roles ─────────────────────────────────────────────────────────
-        # Each role trusts the owning account (federated users assume these via STS)
-        _lf_policy = iam.PolicyDocument(statements=[
+        # Each role trusts the owning account (federated users assume these via STS).
+        # All three roles need Athena + Glue metadata + KMS to execute queries.
+        # The marketing role gets a narrower S3 grant (gold + results only) so that
+        # curated-layer queries fail at IAM before reaching the data, demonstrating
+        # the layered governance boundary in the live demo.
+        _athena_base = [
             iam.PolicyStatement(
                 actions=["lakeformation:GetDataAccess"],
                 resources=["*"],
-            )
+            ),
+            iam.PolicyStatement(
+                actions=[
+                    "athena:StartQueryExecution",
+                    "athena:GetQueryExecution",
+                    "athena:GetQueryResults",
+                    "athena:GetWorkGroup",
+                    "athena:StopQueryExecution",
+                ],
+                resources=[
+                    f"arn:aws:athena:{self.region}:{self.account}:workgroup/ott-analytics-{env_name}"
+                ],
+            ),
+            iam.PolicyStatement(
+                actions=["kms:GenerateDataKey", "kms:Decrypt"],
+                resources=["*"],
+                conditions={"StringEquals": {"kms:CallerAccount": self.account}},
+            ),
+            iam.PolicyStatement(
+                actions=["glue:GetDatabase", "glue:GetTable", "glue:GetPartitions"],
+                resources=["*"],
+            ),
+        ]
+
+        # data-engineering and analyst: full S3 access to the data bucket
+        _lf_policy = iam.PolicyDocument(statements=[
+            *_athena_base,
+            iam.PolicyStatement(
+                actions=[
+                    "s3:PutObject",
+                    "s3:GetObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:GetBucketLocation",
+                    "s3:ListBucket",
+                ],
+                resources=[
+                    f"arn:aws:s3:::ott-search-{self.account}-{env_name}",
+                    f"arn:aws:s3:::ott-search-{self.account}-{env_name}/*",
+                ],
+            ),
+        ])
+
+        # marketing: S3 restricted to gold/ prefix + athena-results/ only
+        # curated/ and raw/ are not listed → curated queries fail at S3/IAM level
+        _marketing_policy = iam.PolicyDocument(statements=[
+            *_athena_base,
+            iam.PolicyStatement(
+                actions=["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"],
+                resources=[
+                    f"arn:aws:s3:::ott-search-{self.account}-{env_name}/gold/*",
+                    f"arn:aws:s3:::ott-search-{self.account}-{env_name}/athena-results/*",
+                ],
+            ),
+            iam.PolicyStatement(
+                actions=["s3:GetBucketLocation", "s3:ListBucket"],
+                resources=[f"arn:aws:s3:::ott-search-{self.account}-{env_name}"],
+            ),
         ])
 
         data_eng_role = iam.Role(
@@ -82,7 +142,7 @@ class GovernanceStack(Stack):
             self, "MarketingRole",
             role_name=f"ott-marketing-{env_name}",
             assumed_by=iam.AccountPrincipal(self.account),
-            inline_policies={"lf-access": _lf_policy},
+            inline_policies={"lf-access": _marketing_policy},
         )
 
         # ── Lake Formation settings ────────────────────────────────────────────
