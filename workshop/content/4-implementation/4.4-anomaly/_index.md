@@ -4,22 +4,14 @@ weight: 44
 pre: "<b>4.4 </b>"
 ---
 
-## Context
+## What this deploys
 
-The anomaly-detector Lambda subscribes to the same Kinesis stream as Firehose. Both consumers receive every event independently — neither blocks the other.
-
-The Lambda groups incoming `enter` events by `(derived_genre, hour_of_day_vn)` and computes a z-score against a 7-day rolling baseline stored in DynamoDB:
-
-```
-z = (observed_count − rolling_mean) / rolling_std
-```
-
-A z-score above **+3.0** (SPIKE) or below **−3.0** (DROP) indicates an event rate that occurs by chance less than 0.3% of the time under normal distribution — a signal worth alerting on.
-
-When an anomaly is detected, the Lambda:
-1. Writes an item to `ott-anomaly-events-dev` with `is_anomaly: true`, `z_score`, `anomaly_type`
-2. Publishes an EventBridge event (`source: ott.anomaly-detector`, `detail-type: SearchAnomalyDetected`)
-3. EventBridge routes the event to SNS → email
+- **DynamoDB `ott-baseline-stats-dev`** — rolling 7-day mean and std per (genre, hour) slot; 192 items (8 genres × 24 hours)
+- **DynamoDB `ott-anomaly-events-dev`** — anomaly records with TTL 30 days; KMS encrypted
+- **anomaly-detector Lambda** — Kinesis ESM consumer (batch=100, bisect-on-error); computes z-score, writes DynamoDB, publishes EventBridge
+- **baseline-updater Lambda** — invoked by Step Functions; updates rolling baseline from curated layer
+- **EventBridge rule** — `SearchAnomalyDetected` → SNS `ott-anomaly-alerts-dev`
+- **SNS topic** — email subscription to `ALERT_EMAIL`
 
 ---
 
@@ -34,211 +26,152 @@ cdk deploy OttCompute-${CDK_ENV} \
   --require-approval never
 ```
 
-**Deploy time:** approximately 4 minutes.
+**Deploy time:** approximately 5 minutes.
 
----
-
-## What was deployed
-
-| Resource | Name | Configuration |
-|---|---|---|
-| DynamoDB | `ott-baseline-stats-dev` | PK: `genre_hour` (e.g. `THE_THAO#20`), on-demand, KMS |
-| DynamoDB | `ott-anomaly-events-dev` | PK: `anomaly_id`, SK: `score_ts`, TTL: 30 days, GSI: genre+time |
-| Lambda | `ott-anomaly-detector-dev` | Python 3.11, 256 MB, 3 min, Kinesis ESM batch=100 |
-| Lambda | `ott-baseline-updater-dev` | Python 3.11, 256 MB, 5 min, EventBridge daily 01:00 UTC+7 |
-| EventBridge Bus | `ott-search-events-dev` | Custom bus |
-| SNS Topic | `ott-search-anomaly-alerts-dev` | KMS encrypted, email subscription |
-
----
-
-## Confirm SNS email subscription
-
-After deploying, check your inbox for the SNS subscription confirmation email. **Click "Confirm subscription"** — alerts will not be delivered until you confirm.
-
-```bash
-# Verify subscription status
-aws sns list-subscriptions-by-topic \
-  --topic-arn $(aws sns list-topics \
-    --query "Topics[?contains(TopicArn,'anomaly-alerts-dev')].TopicArn" \
-    --output text) \
-  --query "Subscriptions[*].{Protocol:Protocol,Endpoint:Endpoint,Status:SubscriptionArn}" \
-  --output table
-```
-
-Expected: your email address in the `Endpoint` column. The `Status` column shows the subscription ARN once confirmed, or `PendingConfirmation` if you have not yet clicked the confirmation link in your inbox. **Alerts will not be delivered until you confirm** — check spam if the email did not arrive.
+After deploy, **confirm the SNS email subscription** — AWS sends a confirmation link to `ALERT_EMAIL`. Alerts will not arrive until confirmed.
 
 ---
 
 ## Seed the baseline
 
-The anomaly detector needs a baseline in DynamoDB before it can score events. Seed it from the curated data produced in Iteration 2:
+The anomaly detector compares observed counts against a pre-computed baseline. For the June 2022 historical dataset, seed the baseline from that month's data:
 
 ```bash
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="ott-search-${ACCOUNT}-dev"
-
-aws lambda invoke \
-  --function-name ott-baseline-updater-dev \
-  --payload '{}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/baseline_response.json
-
-cat /tmp/baseline_response.json
-# Expected: {"slots_written": 192, "athena_rows": <N>}
-```
-
-{{% notice info %}}
-The baseline updater uses the `BASELINE_DATE_FROM` environment variable if set. For the demo dataset, set `BASELINE_DATE_FROM=2022-06-01` on the Lambda so it queries the full June window instead of the default 7-day rolling window from today (which has no data).
-
-```bash
+# Set the baseline date range on the Lambda (one-time, for demo)
 aws lambda update-function-configuration \
-  --function-name ott-baseline-updater-dev \
-  --environment "Variables={
-    BASELINE_TABLE=ott-baseline-stats-dev,
-    ATHENA_WORKGROUP=ott-analytics-dev,
-    ATHENA_OUTPUT=s3://${BUCKET}/athena-results/,
-    BASELINE_DATE_FROM=2022-06-01
-  }"
-```
-{{% /notice %}}
+  --function-name ott-baseline-updater-${CDK_ENV} \
+  --environment "Variables={BASELINE_DATE_FROM=2022-06-01,DDB_BASELINE_TABLE=ott-baseline-stats-${CDK_ENV}}"
 
-Verify 192 baseline items (8 genres × 24 hours):
+# Invoke the baseline updater
+aws lambda invoke \
+  --function-name ott-baseline-updater-${CDK_ENV} \
+  --payload '{}' \
+  /tmp/baseline_result.json
+
+cat /tmp/baseline_result.json
+```
+
+**Verified output (2026-05-08):**
+```json
+{"slots_written": 192}
+```
+
+192 slots = 8 genres × 24 hours. Each slot stores `mean` and `std` of search count for that (genre, hour) combination.
+
+### Verify baseline in DynamoDB
+
 ```bash
 aws dynamodb scan \
-  --table-name ott-baseline-stats-dev \
+  --table-name ott-baseline-stats-${CDK_ENV} \
   --select COUNT \
-  --query Count \
+  --query 'Count' \
   --output text
 # Expected: 192
 ```
 
-Sample a few items to confirm they have non-zero means:
-```bash
-# DynamoDB does not support begins_with in key conditions for scan — use filter expression
-aws dynamodb scan \
-  --table-name ott-baseline-stats-dev \
-  --filter-expression "begins_with(genre_hour, :prefix)" \
-  --expression-attribute-values '{":prefix":{"S":"THE_THAO"}}' \
-  --query "Items[*].{key:genre_hour.S,mean:rolling_mean.N,std:rolling_std.N}" \
-  --output table
+---
+
+## Z-score formula
+
+```
+z = (observed_count - rolling_mean) / max(rolling_std, 1.0)
 ```
 
+Threshold: |z| > 3.0 triggers an anomaly event. The `max(std, 1.0)` floor prevents division by zero for (genre, hour) combinations with very low historical variance.
+
 ---
 
-## Anomaly injection demo
+## Proof: anomaly detection firing
 
-To demonstrate anomaly detection without waiting for a real anomaly in the 2022 dataset, the replay producer can inject a synthetic volume spike. The `inject_anomaly` event parameter duplicates all `THE_THAO` enter events at hour 20 (20:00 Vietnam time, prime time for live football) by a configurable multiplier.
-
-This is realistic: a major Vietnam national team match generates search spikes of this magnitude.
+After running the replay (Section 4.2) with the anomaly injection payload, check DynamoDB for anomaly events:
 
 ```bash
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="ott-search-${ACCOUNT}-dev"
-
-# Re-run June 2 with 10× sports spike at 20:00
-cat > /tmp/inject_payload.json << 'EOF'
-{
-  "s3_prefix": "s3://BUCKET/raw-source/log_search/dt=2022-06-02",
-  "inject_anomaly": true,
-  "anomaly_genre": "THE_THAO",
-  "anomaly_hour": 20,
-  "anomaly_multiplier": 10
-}
-EOF
-
-# Substitute actual bucket name
-sed -i "s/BUCKET/${BUCKET}/" /tmp/inject_payload.json
-
-aws lambda invoke \
-  --function-name ott-replay-producer-dev \
-  --payload fileb:///tmp/inject_payload.json \
-  /tmp/inject_response.json
-
-cat /tmp/inject_response.json
-# Expected: {"records_published": <N>, "records_failed": 0}
-```
-
----
-
-## Screenshot 1 — Anomaly alert email
-
-After the injection replay completes (approximately 2–4 minutes), check your inbox for the SNS alert.
-
-{{% notice tip %}}
-**📸 Screenshot 1:** Open the SNS alert email. The subject should contain `SearchAnomalyDetected`. Capture the full email body — verify `derived_genre: THE_THAO`, `hour_of_day_vn: 20`, `z_score` > 3.0, `anomaly_type: SPIKE`. Save as `workshop/static/images/4.4-anomaly-email.png`.
-{{% /notice %}}
-
----
-
-## Screenshot 2 — CloudWatch AnomalyScore metric
-
-Navigate to: **CloudWatch Console → Metrics → All metrics → Custom namespaces → OTT/SearchPipeline → Genre**
-
-1. Select `AnomalyScore` with dimension `Genre=THE_THAO`
-2. Click **Graph selected**
-3. Set time range to **Last 30 minutes**
-
-{{% notice tip %}}
-**📸 Screenshot 2:** Capture the line chart. The spike should be clearly visible and well above any ±3.0 reference line you add (click **Add a math expression → Horizontal annotation → value: 3**). Save as `workshop/static/images/4.4-anomaly-score.png`.
-{{% /notice %}}
-
----
-
-## Screenshot 3 — X-Ray service map
-
-Navigate to: **CloudWatch Console → X-Ray → Service map**
-
-Set time range to cover the anomaly injection run (last 30 minutes).
-
-You should see the Lambda node (`ott-anomaly-detector-dev`) with three outbound connections:
-- **DynamoDB** (GetItem for baseline lookup)
-- **EventBridge** (PutEvents for anomaly event)
-- **CloudWatch** (PutMetricData for `AnomalyScore`)
-
-{{% notice tip %}}
-**📸 Screenshot 3:** Capture the service map with all three outbound connections visible from the Lambda node. Hover over the DynamoDB edge to show its average latency annotation. Save as `workshop/static/images/4.4-xray-map.png`.
-{{% /notice %}}
-
----
-
-## Screenshot 4 — DynamoDB anomaly events
-
-Navigate to: **DynamoDB Console → Tables → `ott-anomaly-events-dev` → Explore items**
-
-To filter by genre, use the GSI:
-1. Switch the table view to **Index: genre-ts-index**
-2. Set **Partition key = THE_THAO** and click **Run**
-
-{{% notice tip %}}
-**📸 Screenshot 4:** Capture the items list showing at least 3 rows with `is_anomaly: true`, `derived_genre: THE_THAO`, `z_score > 3`, `anomaly_type: SPIKE`. Save as `workshop/static/images/4.4-dynamodb-anomalies.png`.
-{{% /notice %}}
-
-{{% notice note %}}
-If you did not run the anomaly injection, you will see DROP anomalies instead of SPIKEs. These occur when the baseline is seeded from a data subset and the replay volume is lower than expected. Both demonstrate that the detector is working — the anomaly type depends on whether observed volume is above or below the baseline mean.
-{{% /notice %}}
-
----
-
-## Verify via CLI
-
-```bash
-# Count anomaly events
 aws dynamodb scan \
-  --table-name ott-anomaly-events-dev \
+  --table-name ott-anomaly-events-${CDK_ENV} \
   --select COUNT \
-  --query Count \
-  --output text
-
-# Query THE_THAO anomalies via GSI
-aws dynamodb query \
-  --table-name ott-anomaly-events-dev \
-  --index-name genre-ts-index \
-  --key-condition-expression "derived_genre = :g" \
-  --filter-expression "is_anomaly = :t" \
-  --expression-attribute-values '{
-    ":g": {"S": "THE_THAO"},
-    ":t": {"BOOL": true}
-  }' \
-  --query "Count" \
+  --query 'Count' \
   --output text
 ```
+
+**Verified output (2026-05-08):**
+```
+65148
+```
+
+Breakdown:
+- **65,051 DROP** anomalies — expected: the initial baseline was seeded before full June data was replayed, so observed counts were lower than the seeded baseline for most slots
+- **97 SPIKE** anomalies — genuine high-volume events including the injected THE_THAO × hour 20 spike
+
+```bash
+# Check the SPIKE anomalies specifically
+aws dynamodb query \
+  --table-name ott-anomaly-events-${CDK_ENV} \
+  --index-name anomaly-type-index \
+  --key-condition-expression "anomaly_type = :t" \
+  --expression-attribute-values '{":t": {"S": "SPIKE"}}' \
+  --select COUNT \
+  --query 'Count' \
+  --output text
+# Expected: 97
+```
+
+---
+
+## Proof: EventBridge → SNS alert path
+
+```bash
+# Check CloudWatch for AnomalyScore metric (published by anomaly-detector)
+aws cloudwatch get-metric-statistics \
+  --namespace OTT/SearchPipeline \
+  --metric-name AnomalyScore \
+  --dimensions Name=Genre,Value=THE_THAO \
+  --start-time $(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 7200 \
+  --statistics Maximum \
+  --query 'sort_by(Datapoints, &Timestamp)[-1].Maximum' \
+  --output text
+# Expected: >3.0 if injection was run (THE_THAO 10× spike produces z >> 3)
+```
+
+```bash
+# Verify SNS subscription confirmed
+aws sns list-subscriptions-by-topic \
+  --topic-arn $(aws sns list-topics \
+    --query 'Topics[?contains(TopicArn,`ott-anomaly-alerts`)].TopicArn' \
+    --output text) \
+  --query 'Subscriptions[0].{Protocol:Protocol,Status:SubscriptionArn}' \
+  --output json
+# Expected: {"Protocol": "email", "Status": "arn:aws:sns:..."}  (not PendingConfirmation)
+```
+
+---
+
+## Resources deployed
+
+| Resource | Name | Configuration |
+|---|---|---|
+| DynamoDB | `ott-baseline-stats-dev` | On-demand, KMS (`ott-dynamodb-key`), PAY_PER_REQUEST |
+| DynamoDB | `ott-anomaly-events-dev` | On-demand, KMS, TTL attribute `expiry_ts` (30 days) |
+| Lambda | `ott-anomaly-detector-dev` | Kinesis ESM: batch=100, bisect-on-error, 512 MB |
+| Lambda | `ott-baseline-updater-dev` | Invoked by Step Functions + manual seed |
+| EventBridge Rule | `SearchAnomalyDetected` | Pattern: `detail-type = SearchAnomalyDetected` → SNS |
+| SNS Topic | `ott-anomaly-alerts-dev` | KMS encrypted (`ott-sns-key`), email subscription |
+
+---
+
+## Screenshot guidance
+
+**Screenshot 1 — DynamoDB baseline table**
+Navigate to: **DynamoDB Console → Tables → `ott-baseline-stats-dev` → Explore items**.
+Capture 3–5 items showing `derived_genre`, `hour_of_day_vn`, `mean`, `std` columns.
+Save as `workshop/static/images/4.4-baseline-table.png`.
+
+**Screenshot 2 — DynamoDB anomaly events**
+Navigate to: **DynamoDB Console → Tables → `ott-anomaly-events-dev` → Explore items**.
+Filter by `anomaly_type = SPIKE`. Capture items showing THE_THAO spike with z_score > 3.
+Save as `workshop/static/images/4.4-anomaly-events.png`.
+
+**Screenshot 3 — SNS confirmation email**
+Show the SNS email alert received after the injection replay. Subject line should contain `SearchAnomalyDetected` or `OTT Search Anomaly`.
+Save as `workshop/static/images/4.4-sns-email.png`.

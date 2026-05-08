@@ -7,9 +7,9 @@ pre: "<b>7. </b>"
 
 # Live Demo Script
 
-A **10–15 minute** walkthrough of the four QuickSight dashboards plus one terminal command proving the governance boundary. The pipeline does not need to re-run — data is already in QuickSight SPICE from the build.
+A **10–15 minute** walkthrough of the four QuickSight dashboards plus one terminal command proving the governance boundary. The pipeline does not need to re-run — data is already in QuickSight SPICE.
 
-Prepare before presenting: open the four QuickSight dashboards in separate browser tabs. Open a terminal with your AWS credentials loaded. Have the governance demo commands (Step 5) ready to paste.
+**Prepare:** Open the four QuickSight dashboards in separate tabs. Open a terminal with your AWS credentials loaded. Have the governance commands (Step 5) ready to paste.
 
 ---
 
@@ -17,7 +17,7 @@ Prepare before presenting: open the four QuickSight dashboards in separate brows
 
 > "FPT Play has approximately 82,350 search events per day from June 2022 — across sports, music, anime, drama, and Vietnamese film. This pipeline answers three questions the raw event data cannot: **what is trending, what is anomalous, and where is the search experience failing.** I will show you the answer to each question — starting with the most important one."
 
-Navigate to the **Search Quality Profile** dashboard (not the leaderboard — lead with the insight, not the data).
+Navigate to the **Search Quality Profile** dashboard (lead with the insight, not the data volume).
 
 ---
 
@@ -25,19 +25,17 @@ Navigate to the **Search Quality Profile** dashboard (not the leaderboard — le
 
 **Open the abandonment rate heatmap.**
 
-Point to the heatmap:
-
-> "Each cell is the abandonment rate for a content genre × device class combination. Abandonment means: the user typed a search query, got results, and left without clicking anything. A higher abandonment rate means the search results are not relevant."
+> "Each cell is the abandonment rate for a content genre × device class combination. Abandonment means: the user typed a search query, got results, and left without clicking anything. A higher rate means the search results are not relevant."
 
 Point to the darkest cell (UNKNOWN × SmartTV):
 
-> "The UNKNOWN category on SmartTV has approximately **30.95% abandonment** — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
+> "The UNKNOWN category on SmartTV has **30.95% abandonment** — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
 
 Pause.
 
-> "Now look at the genre dimension. THE_THAO × Android is around 4.6% — low abandonment. Sports searches on Android are resolving well. THE_THAO × OTTBox is 8.01%. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
+> "Now look at the genre dimension. THE_THAO × Android is around 4.6% — low abandonment. Sports searches on Android are resolving well. THE_THAO × OTTBox is 8.0%. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
 
-> "A product manager seeing this dashboard files a ticket to expand the genre classifier for SmartTV — not a CDN or search-index bug. Without the pipeline, this signal was buried inside raw event rows that nobody could query. A product team seeing abandonment_rate = 0.3095 on UNKNOWN × SmartTV can prioritise classifier work in the next sprint."
+> "A product manager seeing this dashboard files a ticket to expand the genre classifier — not a CDN or search-index bug. Without the pipeline, this signal was buried inside raw event rows that nobody could query. A product team seeing abandonment_rate = 0.31 on UNKNOWN × SmartTV can prioritise classifier work in the next sprint."
 
 ---
 
@@ -45,7 +43,7 @@ Pause.
 
 **Switch to the anomaly timeline.**
 
-> "The real-time path of the pipeline computes a z-score for every (genre, hour) combination every time a new Kinesis batch arrives — typically every 30–60 seconds. A z-score above 3 means the observed search volume is more than 3 standard deviations above the 7-day rolling mean for that genre at that hour."
+> "The real-time path computes a z-score for every (genre, hour) combination every time a new Kinesis batch arrives — typically every 30–60 seconds. A z-score above 3 means the observed search volume is more than 3 standard deviations above the 7-day rolling mean for that genre at that hour."
 
 Point to the THE_THAO spike at hour 20:
 
@@ -91,7 +89,6 @@ Point to a keyword with `rank_7d_ago = 9999`:
 
 > "Before I close: I want to show you the data governance boundary. Marketing analysts can use these dashboards without ever seeing an individual user's data."
 
-Run the denied query:
 ```bash
 # Assume the Marketing role
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -104,7 +101,7 @@ read -r KEY SECRET TOKEN < <(aws sts assume-role \
 export AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET AWS_SESSION_TOKEN=$TOKEN
 BUCKET="ott-search-${ACCOUNT}-${ENV}"
 
-# Attempt 1: query curated layer — will fail
+# Attempt 1: query curated layer — WILL FAIL
 QID=$(aws athena start-query-execution \
   --query-string "SELECT user_id_hashed FROM ott_search_curated.search_enriched LIMIT 1" \
   --work-group ott-analytics-${ENV} \
@@ -117,11 +114,10 @@ aws athena get-query-execution --query-execution-id $QID \
 
 Show the `FAILED` output:
 
-> "Access denied at S3 — the Marketing role's IAM policy is scoped to the `gold/` prefix. It cannot read `curated/`. Lake Formation additionally restricts which columns are visible in the gold layer. The Marketing analyst cannot reach user-level data by any path."
+> "Access denied at S3 — the Marketing role's IAM policy is scoped to the `gold/` prefix. It cannot read `curated/`. Lake Formation additionally restricts which columns are visible in the gold layer."
 
-Run the permitted query:
 ```bash
-# Attempt 2: query gold layer — will succeed
+# Attempt 2: query gold layer — WILL SUCCEED
 QID=$(aws athena start-query-execution \
   --query-string "SELECT keyword_norm, abandonment_rate, rank_delta
                   FROM ott_search_gold.keyword_trends
@@ -144,21 +140,21 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 ## Closing (1 minute)
 
-**Return to the architecture diagram (Section 3 of the workshop).**
+**Return to the architecture diagram (Section 3).**
 
-> "Every resource in this demo — the VPC, the KMS keys, Kinesis, Firehose, Glue, Step Functions, DynamoDB, SNS, Lake Formation, CloudTrail, GuardDuty, Macie — was deployed from a single CDK command: `cdk deploy --all`. It can be destroyed with `cdk destroy --all`. Total infrastructure cost for this demo run was approximately $9.60, dominated by a one-month QuickSight subscription."
+> "Every resource in this demo — VPC, KMS keys, Kinesis, Firehose, Glue, Step Functions, DynamoDB, SNS, Lake Formation, CloudTrail, GuardDuty, Macie — was deployed from a single CDK command: `cdk deploy --all`. It can be destroyed with `cdk destroy --all`. Total infrastructure cost for this demo run was approximately **$9.60**, dominated by a one-month QuickSight subscription."
 
-> "The pipeline answers the question we started with: where is the search experience failing? On SmartTV, nearly 31% of free-text searches produce no useful result. The classifier is missing the long tail of search vocabulary on the living-room device class. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
+> "The pipeline answers the question we started with: where is the search experience failing? On SmartTV, **nearly 31% of free-text searches produce no useful result**. The classifier is missing the long tail of search vocabulary on the living-room device class. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
 
 ---
 
-## Backup answers for Q&A
+## Backup Q&A
 
-| Question | Where the answer is |
+| Question | Answer |
 |---|---|
-| How accurate is the genre classifier? | UNKNOWN bucket = 55.5% of keywords. Honest, not a failure. LLM fallback handles long tail in prod. |
-| What happens if Glue fails? | Step Functions → PipelineFailure state → SNS → CloudWatch composite alarm fires within 26 hours. Next run reprocesses via predicate. |
+| How accurate is the genre classifier? | UNKNOWN = 55.5% of keywords. Honest, not a failure. LLM fallback handles long tail in production. |
+| What happens if Glue fails? | Step Functions → PipelineFailure state → SNS → CloudWatch composite alarm fires within 26h. Next run reprocesses via predicate. |
 | Why Kinesis instead of just Glue on S3? | Anomaly detection needs ≤5 min latency. Glue startup alone is 5–10 min. Kinesis delivers to Lambda in seconds. |
-| Why PySpark native writer instead of Glue DynamicFrame? | Raw Parquet embeds derived_genre as both a data column and a partition path. DynamicFrame raises `COLUMN_ALREADY_EXISTS`. |
+| Why PySpark native writer instead of Glue DynamicFrame? | Raw Parquet embeds `derived_genre` as both a data column and partition path. DynamicFrame raises `COLUMN_ALREADY_EXISTS`. PySpark DataFrameReader with explicit schema and basePath avoids this. |
 | How does rank_delta work for new keywords? | `COALESCE(rank_7d_ago, 9999)`. New keywords get rank_7d_ago=9999, so rank_delta = 9999 − rank_today. Clearly marks new entrants. |
 | What is `is_cross_partition_date`? | Year in event_ts ≠ year in dt partition. Filters out Buddhist-era and year-0004 corrupt rows that landed in a wrong S3 partition. |

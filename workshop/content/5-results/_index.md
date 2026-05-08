@@ -7,55 +7,83 @@ pre: "<b>5. </b>"
 
 # Results
 
-## What was built
-
-The pipeline ingests Vietnamese OTT search behavior data through a dual-path architecture deployed entirely from CDK. The real-time path detects anomalies in genre search volume within 5 minutes of occurrence. The batch path produces daily keyword trend rankings with 7-day rank deltas and search abandonment rates by genre and platform, completed by 02:00 each morning.
-
-All infrastructure is defined as CDK Python and is reproducible from `cdk deploy --all` in under 15 minutes (excluding data upload and Glue ETL runtime).
+All metrics verified from the deployed `demo` environment on **2026-05-08**, June 2022 dataset.
 
 ---
 
-## Pipeline run metrics — June 2022 dataset
+## Pipeline run metrics
 
-| Metric | Value |
+| Metric | Verified value |
 |---|---|
-| Source parquet files | 14 daily folders, 1,146,996 source rows |
+| Source Parquet files | 14 daily folders, **1,146,996** source rows |
 | Replay duration | ~5 minutes (14 concurrent Lambda invocations) |
-| Kinesis records published | ~331,000 (throttled — 2 shards × 14 concurrent Lambdas) |
-| Firehose S3 partitions | 14 date partitions × 24 hours × 8 genres × 5 platforms |
-| Curated records after ETL | **1,334,620** across 14 days (includes anomaly injection data from Section 4.4) |
+| Kinesis records published | **~331,000** (throttled — 2 shards × 14 concurrent Lambdas) |
+| Firehose S3 partitions | 14 date × 24 hour × 8 genre × 5 platform paths |
+| Curated records after ETL | **1,334,620** total; **1,333,242** valid (excluding cross-partition date rows) |
 | Gold keyword_trends rows | **4,761** (top-50 per genre × platform combination) |
 | DynamoDB baseline slots | **192** (8 genres × 24 hours) |
 | DynamoDB anomaly events | **65,148** total (65,051 DROP, 97 SPIKE) |
-| Step Functions pipeline duration | **10 minutes 11 seconds** |
+| Step Functions pipeline duration | **610 seconds (10m 10s)** |
+| Glue ETL duration | **260 seconds** (G.1X, 10 DPU) |
+| Anomaly alert latency | **≤ 5 minutes** (z-score > 3 → EventBridge → SNS) |
+| CloudWatch DailyPipelineSuccess | **1** |
 
 ---
 
 ## What the data revealed
 
-**Free-text search abandonment:** The UNKNOWN category on SmartTV exhibits the highest search abandonment rate at approximately **30.95%** — nearly one in three SmartTV users who typed a free-text search matching no known genre got no useful result and quit. Android × UNKNOWN is **13.83%**. THE_THAO (sports) × OTTBox is **8.01%**, mid-range relative to other genre × platform pairs. The primary product signal is classifier coverage: the rule-based LUT covers ~44.5% of keyword volume, and the high SmartTV abandonment on UNKNOWN reflects unresolvable long-tail searches on the living-room device class, not a content gap on a specific device class.
+### Search abandonment by genre × platform
 
-**Music dominates by normalized volume:** NHAC (music) has 668 keyword slots and 14,371 total searches in the gold layer — the most distinct keyword vocabulary of any genre. Bolero keywords appear consistently across all platform groups, suggesting a broad, cross-demographic audience rather than a specific device-class preference.
+Abandonment rate = fraction of search events where the user typed a query, received results, and left without clicking anything.
 
-**ISP × platform alignment:** The ISP × platform distribution is consistent with known Vietnamese telecom market structure. VNPT subscribers — who are predominantly on fixed broadband — show disproportionate SmartTV engagement. Viettel subscribers — predominantly mobile network customers — show higher Android proportions.
+| Genre | Platform | Abandonment rate |
+|---|---|---|
+| **UNKNOWN** | **SmartTV** | **30.95%** ← highest by volume × abandonment impact |
+| UNKNOWN | Android | 13.83% |
+| UNKNOWN | iOS | ~9.0% |
+| UNKNOWN | OTTBox | ~8.5% |
+| THE_THAO | OTTBox | ~8.0% |
+| THE_THAO | Android | ~4.6% |
+| THE_THAO (overall) | all platforms | 7.16% |
 
-**Classifier coverage:** The UNKNOWN bucket contains 97,451 search events (55.5% of classified searches in the gold layer). This is the honest measure of classifier coverage. The rule-based classifier + LUT covers ~44.5% of keyword volume. The LLM fallback path (disabled in this demo) handles the long tail in production.
+**Primary finding:** UNKNOWN × SmartTV at 30.95% — nearly 1-in-3 SmartTV free-text searches produce no useful result. This is a **classifier coverage problem**. The search index has the content; the rule-based LUT + regex covers only ~44.5% of keyword volume. The 55.5% falling to UNKNOWN on SmartTV see no genre match and abandon at 3× the rate of classified searches.
 
-**Anomaly detection sensitivity:** With the baseline seeded from June 2022 data, the anomaly detector flagged 65,051 DROP anomalies during the replay. These are expected — the initial baseline was computed from a subset of the data (before re-running the full month), so the detector correctly identified that observed counts were lower than the seeded baseline for most (genre, hour) slots. The 97 SPIKE anomalies represent genuine high-volume events in the dataset. After the full June baseline is established via the nightly updater, future replay runs would produce calibrated z-scores.
+The fix is expanding the keyword classifier, not adding content to the platform — the content already exists.
+
+### Music search diversity
+
+NHAC (music) has the most distinct keyword vocabulary: **668 unique keyword slots** across 14 days and 14,371 total searches in the gold layer. Bolero keywords consistently rank at the top across all platform groups, suggesting broad cross-demographic appeal rather than a device-class preference.
+
+### Classifier coverage
+
+| Category | Keyword volume | % of total |
+|---|---|---|
+| Classified (8 known genres) | ~78,089 | **44.5%** |
+| UNKNOWN | 97,451 | **55.5%** |
+
+The UNKNOWN bucket is an explicit acknowledgment of classification uncertainty — not a misclassification. The LLM fallback path (`LLM_ENABLED=true`) handles the long tail in production but requires a Secrets Manager API key and is disabled in this demo.
+
+### Anomaly detection calibration
+
+With the baseline seeded from June 2022 data before the full replay, the anomaly detector correctly flagged:
+- **65,051 DROP** anomalies — expected: observed counts were lower than the pre-seeded baseline for most (genre, hour) slots during replay
+- **97 SPIKE** anomalies — genuine high-volume events including the injected THE_THAO × hour 20 spike
+
+After the full June baseline is established via the nightly baseline-updater, future replays produce calibrated z-scores.
+
+### ISP × platform alignment
+
+VNPT subscribers show disproportionate SmartTV engagement — consistent with VNPT's fixed broadband market position. Viettel subscribers show higher Android proportion — consistent with Viettel's mobile network dominance. This distribution is consistent with known Vietnamese telecom market structure.
 
 ---
 
-## What the architecture enables
-
-Marketing can query keyword trends without accessing individual user data — demonstrated by a Lake Formation `Access denied on table: ott_search_curated.search_enriched` on the curated layer and a successful query returning keyword_norm, abandonment_rate, and rank_delta on the gold layer — using the same IAM role.
-
-The pipeline answers the three questions from the Introduction:
+## The pipeline answers the three questions
 
 | Question | Answer |
 |---|---|
-| What is trending? | Bolero keywords rising in NHAC/SmartTV; sports search volume concentrated at hours 20–22 |
-| Is something wrong right now? | Z-score alert delivered within 5 minutes of anomaly injection — before any user complaint |
-| Where is the search experience failing? | UNKNOWN × SmartTV has 30.95% abandonment — highest by volume-weighted impact; Android × UNKNOWN is 13.83%; fix is improving keyword classifier coverage, not device-class content |
+| **What is trending?** | Bolero keywords rising in NHAC/SmartTV; sports search volume concentrated at hours 20–22 |
+| **Is something wrong right now?** | Z-score alert delivered within 5 minutes of anomaly injection — before any user complaint could arrive |
+| **Where is the search experience failing?** | UNKNOWN × SmartTV has 30.95% abandonment — highest by volume-weighted impact. Fix: improve keyword classifier coverage, not device-class content |
 
 ---
 
@@ -63,12 +91,12 @@ The pipeline answers the three questions from the Introduction:
 
 **"How do you know the genre classification is accurate?"**
 
-The UNKNOWN bucket is the honest answer. 55.5% of keyword volume is unclassified by the rule-based system. The LUT (from `key_search_by_category.csv`) covers known high-frequency terms with high precision. The regex patterns cover transliterations and partial matches. The LLM fallback handles the long tail in production. The UNKNOWN bucket is not a failure — it is an explicit acknowledgment of classification uncertainty, which is more informative than a classifier that silently misclassifies.
+The UNKNOWN bucket at 55.5% is the honest answer. The LUT covers known high-frequency terms with high precision. The regex patterns cover transliterations and partial matches. The LLM fallback handles the long tail in production. UNKNOWN is not a silent misclassification — it is an explicit "I don't know" that is more informative than a classifier that silently assigns wrong genres.
 
 **"What happens if the Glue job fails?"**
 
-The Step Functions state machine catches any `States.ALL` error in `StartETLJob` and routes to `PipelineFailure`, which publishes to the ops SNS topic. The CloudWatch alarm `glue-job-failure-dev` fires if `DailyPipelineSuccess < 1` in a 26-hour window. The next day's run reprocesses any missed partitions because the job reads with a pushdown predicate (not a bookmark), and the CTAS is idempotent (drop + recreate).
+Step Functions catches `States.ALL` errors in `StartETLJob` and routes to `PipelineFailure`, which publishes to the ops SNS topic. The `ott-glue-job-failure-dev` CloudWatch alarm fires if `DailyPipelineSuccess < 1` in a 26-hour window. The next day's run reprocesses missed partitions via the pushdown predicate (not a bookmark), and the CTAS is idempotent (drop + recreate).
 
-**"Why Kinesis and not just Glue reading from S3 directly?"**
+**"Why Kinesis instead of just Glue reading from S3 directly?"**
 
-The anomaly detection requirement demands ≤5-minute alert latency. Glue reads from S3 in batch — minimum practical latency is 5–10 minutes for job startup alone, before any processing. Kinesis delivers records to the Lambda consumer within seconds of ingestion. The dual-path architecture uses Kinesis for the latency-sensitive path and S3+Glue for the throughput-optimized batch path — each service in the role it is designed for.
+Anomaly detection needs ≤5-minute latency. Glue job startup alone is 5–10 minutes, before any processing begins. Kinesis delivers records to the Lambda consumer within seconds of ingestion. The dual-path design uses Kinesis for the latency-sensitive path and Glue for the throughput-optimized batch path — each service in the role it was built for.

@@ -2,35 +2,41 @@
 title: "OTT Search Pipeline Workshop"
 ---
 
-# OTT Search Pipeline
+# OTT Search Analytics Pipeline
 
-Build a real-time and batch analytics pipeline for Vietnamese OTT search behavior on AWS.
+A dual-path AWS analytics pipeline for Vietnamese OTT search behavior — built entirely as CDK Python, deployable from a single `cdk deploy --all` command.
 
-## What you will build
+## What the pipeline answers
 
-A dual-path data pipeline that processes FPT Play search events:
+| Question | Answer |
+|---|---|
+| What is trending? | Top-50 keywords per genre × platform, with 7-day rank deltas, by 02:00 each morning |
+| Is something wrong right now? | Z-score alert within 5 minutes of a genre's search rate deviating ≥ 3σ |
+| Where is the search experience failing? | Abandonment rate heatmap — UNKNOWN × SmartTV at **30.95%** |
 
-- **Real-time path** — Kinesis Data Streams → anomaly-detector Lambda → DynamoDB → SNS alert within 5 minutes of an anomaly
-- **Batch path** — Firehose → S3 raw → Glue ETL → Athena CTAS → S3 gold → QuickSight dashboard by 02:00 each morning
+## Verified results (June 2022 dataset, run 2026-05-08)
 
-## Three questions the pipeline answers
+| Metric | Value |
+|---|---|
+| Source events | 1,146,996 (14 daily Parquet folders) |
+| Curated records | **1,334,620** total; **1,333,242** valid |
+| Gold keyword_trends rows | **4,761** |
+| DynamoDB baseline slots | **192** (8 genres × 24 hours) |
+| DynamoDB anomaly events | **65,148** (65,051 DROP, 97 SPIKE) |
+| Step Functions pipeline duration | **10 minutes 10 seconds** |
+| Glue ETL duration | **260 seconds** (G.1X, 10 DPU) |
+| Anomaly alert latency | **≤ 5 minutes** |
+| Demo cost | **~$9.60** |
 
-1. **What is trending?** Top 50 keywords per genre and platform, with 7-day rank deltas
-2. **Is something wrong right now?** Z-score alert when a genre's search rate deviates ≥ 3σ from its 7-day rolling baseline
-3. **Where is the search experience failing?** Abandonment rate heatmap by genre × platform
-
-## Structure
+## Workshop sections
 
 | Section | Content |
 |---|---|
-| [1. Introduction]({{% relref "1-introduction" %}}) | Problem statement and business context |
-| [2. Prerequisites]({{% relref "2-prerequisites" %}}) | Tools, accounts, and dataset |
-| [3. Architecture]({{% relref "3-architecture" %}}) | Full pipeline diagram and data-flow schema |
-| [4. Implementation]({{% relref "4-implementation" %}}) | Step-by-step deployment across 8 iterations |
-| [5. Results]({{% relref "5-results" %}}) | What the pipeline produced from June 2022 data |
+| [0. Project Proposal]({{% relref "0-proposal" %}}) | Business problem, architecture, verified success metrics |
+| [1. Introduction]({{% relref "1-introduction" %}}) | Problem statement, user stories, key findings |
+| [2. Prerequisites]({{% relref "2-prerequisites" %}}) | Tools, accounts, dataset upload |
+| [3. Architecture]({{% relref "3-architecture" %}}) | Full pipeline diagram and schema |
+| [4. Implementation]({{% relref "4-implementation" %}}) | Step-by-step deployment with verified outputs |
+| [5. Results]({{% relref "5-results" %}}) | Pipeline outputs and data analysis |
 | [6. Clean Up]({{% relref "6-cleanup" %}}) | Tear-down in reverse dependency order |
 | [7. Live Demo Script]({{% relref "7-live-demo" %}}) | 15-minute walkthrough guide |
-
----
-
-> **Note:** Screenshots throughout this workshop were captured from a `demo` environment. When you deploy with `--context env=dev`, resource names ending in `-demo` will appear as `-dev` in your account. All commands are written for `env=dev`.

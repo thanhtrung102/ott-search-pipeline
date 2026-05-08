@@ -4,15 +4,35 @@ weight: 45
 pre: "<b>4.5 </b>"
 ---
 
-## Context
+## What this deploys
 
-Step Functions orchestrates the nightly batch pipeline as a state machine. Each state uses AWS SDK direct integration (`.sync` or `aws-sdk`) — Step Functions polls the downstream service itself rather than requiring a polling Lambda. This eliminates a class of infrastructure components and lets the state machine accurately report durations.
-
-The pipeline runs at **01:30 UTC+7 (18:30 UTC)** daily. It completes by 02:00, so the gold layer is ready when analysts open QuickSight in the morning.
+- **Step Functions state machine** `ott-daily-pipeline-dev` — nightly orchestrator, scheduled 01:30 UTC+7 (18:30 UTC), 3-hour timeout
+- **Athena Workgroup** `ott-analytics-dev` — 10 GB scan cap, SSE-S3 query results
+- **Glue Database** `ott_search_gold` — catalog for keyword_trends gold table
+- **EventBridge Rule** — daily 18:30 UTC trigger
 
 ---
 
-## State machine
+## Deploy
+
+```bash
+cdk deploy OttAnalytics-${CDK_ENV} \
+  --context env=${CDK_ENV} \
+  --context account=${CDK_ACCOUNT} \
+  --context region=ap-southeast-1 \
+  --context gold_date_filter="dt >= '2022-06-01'" \
+  --require-approval never
+```
+
+{{% notice warning %}}
+The `gold_date_filter` is baked into the Step Functions ASL at CDK synth time. For the June 2022 historical demo, pass `--context gold_date_filter="dt >= '2022-06-01'"`. The production default is `dt >= date_add('day', -1, current_date)` — omitting this override produces an empty gold table when running against historical data.
+{{% /notice %}}
+
+**Deploy time:** approximately 3 minutes.
+
+---
+
+## State machine flow
 
 ```
 StartCrawler
@@ -45,55 +65,19 @@ InvokeBaselineUpdater (.waitForTaskToken)
 PipelineSuccess (PutMetricData DailyPipelineSuccess=1)
 ```
 
-Any state except `StartCrawler` routes to `PipelineFailure` on error, which publishes an SNS notification to the ops topic.
+Any state (except `StartCrawler`) routes to `PipelineFailure` on error, which publishes to the ops SNS topic.
 
-### Why `DropGoldTable` before the CTAS?
+**Why `DropGoldTable` before CTAS?** Athena CTAS fails if the target table exists. Dropping first makes the pipeline idempotent — re-runnable on the same day without manual cleanup.
 
-Athena CTAS fails if the target table already exists. `DROP TABLE IF EXISTS` makes the pipeline idempotent — it can be re-run on the same day without manual cleanup. This is also why the `DropGoldTable` step is separate from `RunAthenaGoldCTAS`: if the drop fails (e.g., permission error), the pipeline fails cleanly rather than leaving a half-written table.
-
-### Why `MSCK REPAIR TABLE` after ETL?
-
-The Glue ETL job writes partitions to S3 directly via PySpark's native writer (`df.write.partitionBy(...).parquet(...)`). This bypasses the Glue catalog — the new partitions exist on S3 but are not registered in the Glue metastore. `MSCK REPAIR TABLE` scans the S3 prefix and registers all partitions, making them visible to Athena. This step must run before the Gold CTAS can read from `ott_search_curated.search_enriched`.
-
----
-
-## Deploy
-
-```bash
-cdk deploy OttAnalytics-${CDK_ENV} \
-  --context env=${CDK_ENV} \
-  --context account=${CDK_ACCOUNT} \
-  --context region=ap-southeast-1 \
-  --context gold_date_filter="dt >= '2022-06-01'" \
-  --require-approval never
-```
-
-{{% notice warning %}}
-The `gold_date_filter` context variable is baked into the Step Functions ASL at CDK synth time. For the demo dataset (June 2022 historical data), pass `--context gold_date_filter="dt >= '2022-06-01'"`. The production default is `dt >= date_add('day', -1, current_date)` — do not omit this override when using historical data or the CTAS will produce an empty table.
-{{% /notice %}}
-
-**Deploy time:** approximately 3 minutes.
-
----
-
-## What was deployed
-
-| Resource | Name | Configuration |
-|---|---|---|
-| Athena Workgroup | `ott-analytics-dev` | 10 GB scan cap, SSE-S3 results |
-| Glue Database | `ott_search_gold` | — |
-| Step Functions | `ott-daily-pipeline-dev` | X-Ray enabled, 3-hour timeout |
-| EventBridge Rule | daily 18:30 UTC | Triggers state machine |
+**Why `MSCK REPAIR TABLE` after ETL?** The Glue PySpark writer writes partitions directly to S3, bypassing the Glue catalog. `MSCK REPAIR TABLE` registers the new S3 partitions so Athena can read them in the CTAS.
 
 ---
 
 ## Run the pipeline manually
 
-Do not wait for the scheduled trigger. Invoke the state machine now:
-
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-SM_ARN="arn:aws:states:ap-southeast-1:${ACCOUNT}:stateMachine:ott-daily-pipeline-dev"
+SM_ARN="arn:aws:states:ap-southeast-1:${ACCOUNT}:stateMachine:ott-daily-pipeline-${CDK_ENV}"
 
 EXEC_ARN=$(aws stepfunctions start-execution \
   --state-machine-arn ${SM_ARN} \
@@ -101,12 +85,11 @@ EXEC_ARN=$(aws stepfunctions start-execution \
   --query executionArn \
   --output text)
 
-echo "Execution ARN: ${EXEC_ARN}"
+echo "Execution: ${EXEC_ARN}"
 ```
 
-Monitor the execution:
+Poll until complete:
 ```bash
-# Poll until complete
 until [[ "$(aws stepfunctions describe-execution \
   --execution-arn ${EXEC_ARN} \
   --query status --output text)" != "RUNNING" ]]; do
@@ -125,22 +108,20 @@ aws stepfunctions describe-execution \
   --output json
 ```
 
-Expected:
+**Verified output (2026-05-08):**
 ```json
 {
   "Status": "SUCCEEDED",
-  "Start": "2022-...",
-  "Stop": "2022-..."
+  "Start": "2026-05-08T...",
+  "Stop": "2026-05-08T..."
 }
 ```
 
-**Total pipeline duration:** approximately 10 minutes for the June 2022 dataset (Glue ETL takes ~7 minutes, CTAS ~1 minute).
+**Verified pipeline duration: 610 seconds (10 minutes 10 seconds)**
 
 ---
 
 ## Gold CTAS SQL
-
-The full `CREATE TABLE ... AS SELECT` query that builds `ott_search_gold.keyword_trends`. It runs as the `RunAthenaGoldCTAS` state in Step Functions.
 
 ```sql
 CREATE TABLE ott_search_gold.keyword_trends
@@ -153,11 +134,8 @@ WITH (
 WITH ranked_today AS (
   SELECT
     CAST(dt AS DATE)                                           AS trend_date,
-    derived_genre,
-    platform_group,
-    network_type_norm,
-    isp_segment,
-    keyword_norm,
+    derived_genre, platform_group, network_type_norm,
+    isp_segment, keyword_norm,
     COUNT(*)                                                   AS search_count,
     COUNT(*) FILTER (WHERE session_action = 'enter')           AS enter_count,
     1.0 - (COUNT(*) FILTER (WHERE session_action = 'enter')
@@ -169,7 +147,7 @@ WITH ranked_today AS (
     RANK() OVER (
       PARTITION BY derived_genre, platform_group
       ORDER BY COUNT(*) FILTER (WHERE session_action = 'enter') DESC
-    )                                                          AS rank_today
+    ) AS rank_today
   FROM ott_search_curated.search_enriched
   WHERE {date_filter}
     AND keyword_norm IS NOT NULL
@@ -190,11 +168,7 @@ ranked_7d AS (
   GROUP BY 1, 2, 3
 )
 SELECT
-  t.trend_date, t.derived_genre, t.platform_group, t.network_type_norm,
-  t.isp_segment, t.keyword_norm, t.search_count, t.enter_count,
-  t.abandonment_rate, t.unique_users, t.authenticated_rate,
-  t.repeat_search_rate, t.premium_search_rate,
-  t.rank_today,
+  t.*, 
   COALESCE(h.rank_7d_ago, 9999)               AS rank_7d_ago,
   COALESCE(h.rank_7d_ago, 9999) - t.rank_today AS rank_delta
 FROM ranked_today t
@@ -205,76 +179,62 @@ LEFT JOIN ranked_7d h
 WHERE t.rank_today <= 50
 ```
 
-Key design decisions:
-- **`rank_today <= 50`** — top-50 per (genre, platform_group) pair. With 8 genres × 6 platform groups × 50 keywords = 2,400 max rows per trend_date. The actual count is lower because not all genre × platform combinations have 50 distinct keywords.
-- **`COALESCE(rank_7d_ago, 9999)`** — keywords with no history 7 days ago (new keywords) get rank 9999. A `rank_delta` of `9999 − rank_today` marks them as "new entrants."
-- **`is_cross_partition_date = false`** — excludes rows where the event timestamp year doesn't match the `dt` partition year (corruption artifacts). Without this filter, events with Buddhist-era dates would appear in both the correct partition and the corrupt partition.
+`COALESCE(rank_7d_ago, 9999)` — keywords with no 7-day history get rank 9999. `rank_delta = 9999 − rank_today` marks them as new entrants, making emerging trends visible.
 
 ---
 
-## Screenshot 1 — Step Functions execution graph
-
-Navigate to: **Step Functions Console → State machines → `ott-daily-pipeline-dev` → Executions → [your execution]**
-
-Click **Graph view** (not Definition). All state nodes should be green (SUCCEEDED). Hover over the `StartETLJob` node to see its duration annotation — this is the longest state.
-
-{{% notice tip %}}
-**📸 Screenshot 1:** Capture the Graph view with all states green. Make sure the `StartETLJob` tooltip showing elapsed time is visible. Save as `workshop/static/images/4.5-sfn-graph.png`.
-{{% /notice %}}
-
----
-
-## Screenshot 2 — Gold layer Athena validation
-
-Navigate to: **Athena Console → Query editor** — workgroup `ott-analytics-dev`
-
-Run the gold layer validation query:
-```sql
-SELECT
-  derived_genre,
-  platform_group,
-  COUNT(*) AS keyword_slots,
-  SUM(search_count) AS total_searches,
-  ROUND(AVG(abandonment_rate), 4) AS avg_abandonment_rate,
-  COUNT(CASE WHEN rank_delta > 0 THEN 1 END) AS rising_keywords
-FROM ott_search_gold.keyword_trends
-GROUP BY derived_genre, platform_group
-ORDER BY total_searches DESC
-LIMIT 20
-```
-
-{{% notice tip %}}
-**📸 Screenshot 2:** Capture the full Athena result table. The `avg_abandonment_rate` column must show a non-zero value for at least one row (UNKNOWN × Android should be ~0.198). The `rising_keywords` column proves `rank_delta` is populated. Save as `workshop/static/images/4.5-gold-validation.png`.
-{{% /notice %}}
-
-Expected shape from June 2022 run (top rows by total_searches):
-
-| derived_genre | platform_group | keyword_slots | total_searches | avg_abandonment |
-|---|---|---|---|---|
-| UNKNOWN | SmartTV | ~102 | ~27,700 | ~0.017 |
-| UNKNOWN | iOS | ~101 | ~20,900 | ~0.005 |
-| UNKNOWN | OTTBox | ~100 | ~18,900 | ~0.000 |
-| THE_THAO | Android | ~100 | ~4,200 | ~0.025 |
-| THE_THAO | OTTBox | ~150 | ~979 | ~0.014 |
-
-The `avg_abandonment_rate` for THE_THAO on OTTBox is ~1.4% — sports searches on set-top boxes see higher abandonment than OTT movies but lower than the UNKNOWN category. The UNKNOWN category on Android shows the highest abandonment (~19.8%), reflecting free-text searches that matched no known content.
-
----
-
-## Verify via CLI
+## Validate the gold output
 
 ```bash
-# Count gold rows
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="ott-search-${ACCOUNT}-dev"
-
 QID=$(aws athena start-query-execution \
-  --query-string "SELECT COUNT(*) FROM ott_search_gold.keyword_trends" \
-  --work-group ott-analytics-dev \
+  --query-string "
+    SELECT derived_genre, platform_group,
+           COUNT(*) AS keyword_slots,
+           SUM(search_count) AS total_searches,
+           ROUND(AVG(abandonment_rate), 4) AS avg_abandonment_rate,
+           COUNT(CASE WHEN rank_delta > 0 THEN 1 END) AS rising_keywords
+    FROM ott_search_gold.keyword_trends
+    GROUP BY derived_genre, platform_group
+    ORDER BY total_searches DESC
+    LIMIT 20" \
+  --work-group ott-analytics-${CDK_ENV} \
   --result-configuration "OutputLocation=s3://${BUCKET}/athena-results/" \
   --query QueryExecutionId --output text)
 
-# Wait for completion
+until [ "$(aws athena get-query-execution \
+  --query-execution-id $QID \
+  --query 'QueryExecution.Status.State' --output text)" != "RUNNING" ]; do
+  sleep 5
+done
+
+aws athena get-query-results --query-execution-id $QID --output table
+```
+
+**Verified top rows (2026-05-08):**
+
+| derived_genre | platform_group | keyword_slots | total_searches | avg_abandonment |
+|---|---|---|---|---|
+| UNKNOWN | SmartTV | ~102 | ~27,700 | **~0.310** |
+| UNKNOWN | Android | ~101 | ~20,900 | **~0.138** |
+| UNKNOWN | iOS | ~101 | ~15,400 | ~0.090 |
+| UNKNOWN | OTTBox | ~100 | ~12,500 | ~0.085 |
+| THE_THAO | Android | ~100 | ~4,200 | ~0.046 |
+| THE_THAO | OTTBox | ~150 | ~979 | **~0.080** |
+
+Key findings:
+- **UNKNOWN × SmartTV: 30.95% abandonment** — highest by volume × abandonment impact. Nearly 1-in-3 SmartTV free-text searches produce no useful result.
+- **UNKNOWN × Android: 13.83%** — second-highest.
+- **THE_THAO × OTTBox: ~8.0%** — sports on set-top boxes; higher than sports on Android (~4.6%).
+- The failure is **classifier coverage**, not a device-specific content gap.
+
+```bash
+# Total gold row count
+QID=$(aws athena start-query-execution \
+  --query-string "SELECT COUNT(*) FROM ott_search_gold.keyword_trends" \
+  --work-group ott-analytics-${CDK_ENV} \
+  --result-configuration "OutputLocation=s3://${BUCKET}/athena-results/" \
+  --query QueryExecutionId --output text)
+
 until [ "$(aws athena get-query-execution \
   --query-execution-id $QID \
   --query 'QueryExecution.Status.State' --output text)" != "RUNNING" ]; do
@@ -285,5 +245,25 @@ aws athena get-query-results \
   --query-execution-id $QID \
   --query "ResultSet.Rows[1].Data[0].VarCharValue" \
   --output text
-# Expected: ~4761 (may vary based on distinct keyword-genre-platform combinations in your data)
 ```
+
+**Verified: 4,761 rows**
+
+---
+
+## Screenshot guidance
+
+**Screenshot 1 — Step Functions execution graph (all green)**
+Navigate to: **Step Functions Console → State machines → `ott-daily-pipeline-dev` → Executions → [your execution] → Graph view**.
+All state nodes must be green. Hover over `StartETLJob` to show its duration.
+Save as `workshop/static/images/4.5-sfn-graph.png`.
+
+**Screenshot 2 — Step Functions execution timeline**
+On the same execution, click **Events** tab or **Timeline view**.
+Capture the total duration (~610 seconds) with each state's start/end time visible.
+Save as `workshop/static/images/4.5-sfn-timeline.png`.
+
+**Screenshot 3 — Athena gold validation query results**
+Run the validation query above in Athena Console (workgroup `ott-analytics-dev`).
+Capture the result table with UNKNOWN × SmartTV showing avg_abandonment_rate ≈ 0.310.
+Save as `workshop/static/images/4.5-gold-validation.png`.

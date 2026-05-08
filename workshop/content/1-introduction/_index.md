@@ -9,9 +9,12 @@ pre: "<b>1. </b>"
 
 ## Problem statement
 
-FPT Play's Product Analytics team has no way to detect emerging content trends or search experience failures in real time. The raw `log_search` table exists in a data warehouse, but it is refreshed once per day in batch — which means a sports search failure at 20:00 (prime time for live football) is not visible until 08:00 the next morning, eight hours after the event.
+FPT Play's Product Analytics team has no way to detect emerging content trends or search experience failures in real time. The raw `log_search` table exists in a data warehouse, but it refreshes once per day in batch — which means a sports search failure at 20:00 (prime time for live football) is not visible until 08:00 the next morning.
 
-This pipeline closes that gap.
+This pipeline closes that gap with two paths built on the same Kinesis stream:
+
+- **Real-time path** — anomaly-detector Lambda computes z-scores and sends SNS alerts within 5 minutes
+- **Batch path** — Firehose → Glue ETL → Step Functions → Athena CTAS → QuickSight by 02:00 daily
 
 ## User stories
 
@@ -21,15 +24,21 @@ This pipeline closes that gap.
 
 > *As a Data Governance officer, I want Marketing analysts to be able to query keyword trend data without seeing individual user activity or authentication status, so that the platform complies with its data privacy commitments.*
 
-## Why this matters
+## Key findings from the data
 
-Free-text searches that match no known genre pattern (the UNKNOWN category) exhibit the highest abandonment on SmartTV at **30.95%** in the June 2022 dataset — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. The overall sports (THE_THAO) abandonment rate is **7.16%**, with OTTBox at **8.01%** — disproportionately K+ premium subscribers hitting a live broadcast content gap.
+All figures verified against the `demo` environment on **2026-05-08**:
 
-The pipeline surfaces this within minutes of it occurring, rather than the next morning.
+| Finding | Value |
+|---|---|
+| Highest abandonment | **UNKNOWN × SmartTV: 30.95%** — nearly 1-in-3 SmartTV free-text searches produce no useful result |
+| Second-highest abandonment | UNKNOWN × Android: 13.83% |
+| Sports (THE_THAO) overall | 7.16% abandonment; OTTBox: 8.01%; Android: 4.63% |
+| Classifier coverage | Rule-based LUT covers ~44.5% of keyword volume; 55.5% falls to UNKNOWN |
+| Music keyword diversity | NHAC: 668 distinct keyword slots in gold layer — highest of any genre |
+
+The primary signal: the UNKNOWN × SmartTV abandonment is a **classifier coverage problem**, not a content gap. The search index has the content; the classifier cannot map the free-text query to it. This pipeline makes that visible within minutes of occurrence.
 
 ## What is being built
-
-The pipeline processes 14 days of `log_search` Parquet files (1,146,996 source events) through a two-layer architecture deployed entirely from CDK:
 
 ```
 log_search Parquet files (S3)
@@ -50,19 +59,19 @@ Kinesis Firehose         anomaly-detector Lambda
     ▼                         ▼
 S3 raw/events/           DynamoDB ott-anomaly-events
 (partitioned by          EventBridge → SNS alert
- dt/hour/genre/platform)
+ dt/hour/genre/platform) (≤ 5 min latency)
     │
     ▼
-Glue Crawler → Glue ETL (18-step enrichment)
+Glue Crawler → Glue ETL (18-step enrichment, 260s)
     │
     ▼
-S3 curated/search_enriched/
+S3 curated/search_enriched/ (1,334,620 records)
     │
     ▼
-Step Functions → Athena CTAS
+Step Functions → Athena CTAS (10m 10s total)
     │
     ▼
-S3 gold/keyword_trends/ → QuickSight dashboard
+S3 gold/keyword_trends/ (4,761 rows) → QuickSight
 ```
 
-All infrastructure is defined as CDK Python. A reader with this repository can reproduce the entire deployed state from a single `cdk deploy --all` command.
+All infrastructure is CDK Python. Reproducible from `cdk deploy --all` in under 15 minutes.

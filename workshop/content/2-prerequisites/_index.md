@@ -7,37 +7,27 @@ pre: "<b>2. </b>"
 
 # Prerequisites
 
-Complete every item in this checklist before starting Section 4. The workshop commands will fail silently if a dependency is missing.
+Complete every item before starting Section 4. Commands will fail silently if a dependency is missing.
 
 ---
 
 ## Checklist
 
-### 1. AWS Account with AdministratorAccess
+### 1. AWS Account — AdministratorAccess
 
-Required for initial CDK bootstrap only. After bootstrap the pipeline uses least-privilege IAM roles.
+Required for CDK bootstrap only. After bootstrap the pipeline uses least-privilege IAM roles.
 
-Verify your identity:
 ```bash
 aws sts get-caller-identity
+# Expected: {"UserId": "...", "Account": "123456789012", "Arn": "arn:aws:iam::..."}
 ```
-Expected: a JSON object with your `Account`, `UserId`, and `Arn`. If this returns an error, run `aws configure` first.
-
----
 
 ### 2. AWS CLI v2
 
 ```bash
-# Install (Linux/macOS)
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip && sudo ./aws/install
-
-# Verify
 aws --version
-# Expected: aws-cli/2.x.x Python/3.x.x ...
+# Expected: aws-cli/2.x.x Python/3.x.x
 ```
-
----
 
 ### 3. Python 3.11
 
@@ -46,20 +36,12 @@ python3 --version
 # Expected: Python 3.11.x
 ```
 
-If you have `pyenv`: `pyenv install 3.11.9 && pyenv local 3.11.9`
-
----
-
 ### 4. Node.js 18+
-
-Required by the AWS CDK CLI.
 
 ```bash
 node --version
 # Expected: v18.x.x or v20.x.x
 ```
-
----
 
 ### 5. AWS CDK v2
 
@@ -69,106 +51,87 @@ cdk --version
 # Expected: 2.x.x (build xxxxxxx)
 ```
 
----
-
-### 6. Git
+### 6. cfn-nag (Ruby gem — for Iteration 7 CI/CD)
 
 ```bash
-git --version
-# Expected: git version 2.x.x
-```
-
----
-
-### 7. cfn-nag (security static analysis)
-
-Used in the CI/CD pipeline (Iteration 7) to catch CloudFormation security misconfigurations before deploy.
-
-```bash
-# Requires Ruby
 gem install cfn-nag
-
 cfn_nag_scan --version
 # Expected: cfn-nag x.x.x
 ```
 
----
-
-### 8. Clone the repository
+### 7. Clone the repository and create venv
 
 ```bash
-git clone https://github.com/{YOUR_USERNAME}/ott-search-pipeline
+git clone https://github.com/thanhtrung102/ott-search-pipeline
 cd ott-search-pipeline
-
 python3 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
----
-
-### 9. Dataset: log_search Parquet files
-
-The source data is 14 daily folders of `log_search` Parquet files from June 2022.
-
-Upload them to the source prefix in your S3 bucket. The files need to be in `dt=YYYY-MM-DD` folder format:
+### 8. CDK bootstrap
 
 ```bash
-# After StorageStack is deployed (Section 4.1), run:
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="ott-search-${ACCOUNT}-dev"
+export CDK_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export CDK_ENV=dev
+export ALERT_EMAIL=your@email.com
+export BUCKET="ott-search-${CDK_ACCOUNT}-${CDK_ENV}"
 
+cdk bootstrap aws://${CDK_ACCOUNT}/ap-southeast-1
+# Expected: ✅  Environment aws://123456789012/ap-southeast-1 bootstrapped.
+```
+
+### 9. Dataset upload
+
+Upload the June 2022 `log_search` Parquet files to S3 **after** deploying OttStorage (Section 4.1):
+
+```bash
 for dir in /path/to/log_search/2022*/; do
-  raw_date=$(basename "$dir")        # e.g. 20220601
-  dt="dt=${raw_date:0:4}-${raw_date:4:2}-${raw_date:6:2}"   # dt=2022-06-01
+  raw_date=$(basename "$dir")          # e.g. 20220601
+  dt="dt=${raw_date:0:4}-${raw_date:4:2}-${raw_date:6:2}"  # dt=2022-06-01
   aws s3 cp "$dir" "s3://${BUCKET}/raw-source/log_search/${dt}/" \
     --recursive --exclude ".*" --exclude "_SUCCESS"
 done
-```
 
-Verify the upload:
-```bash
+# Verify
 aws s3 ls "s3://${BUCKET}/raw-source/log_search/" | grep PRE | wc -l
 # Expected: 14
 ```
 
+### 10. QuickSight (for Iteration 5 only — manual console step)
+
+QuickSight Standard cannot be provisioned by CDK.
+
+1. AWS Console → **QuickSight** → **Sign up for QuickSight**
+2. Select **Standard** (~$9/month — cancel after demo)
+3. Region: **ap-southeast-1**
+4. Allow access to **Amazon Athena** and bucket `ott-search-{account}-dev`
+
+### 11. SNS email confirmation
+
+After `cdk deploy OttCompute-dev`, AWS sends a subscription confirmation email to `ALERT_EMAIL`. Click the link to confirm — alerts will not arrive until confirmed.
+
 ---
 
-### 10. QuickSight account (for Iteration 5 only)
+## Shell variables reference
 
-QuickSight cannot be activated via CDK. This is a one-time manual step:
+Set these in your shell before starting Section 4. Every `cdk deploy` command uses them:
 
-1. Open the AWS Console → search **QuickSight**
-2. Click **Sign up for QuickSight**
-3. Select **Standard** (sufficient for this workshop — ~$9/month, cancel after demo)
-4. Region: **ap-southeast-1**
-5. Account name: `ott-search-analytics` (or any name you choose)
-6. Notification email: your email address
-7. Check **Amazon Athena** under S3 access settings
-
----
-
-### 11. Email address for SNS anomaly alerts
-
-You will pass this as a CDK context variable. Alerts are sent here when the anomaly detector fires.
-
-Note it now — you will use it in every `cdk deploy` command:
+```bash
+export CDK_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export CDK_ENV=dev
+export ALERT_EMAIL=your@email.com
+export BUCKET="ott-search-${CDK_ACCOUNT}-${CDK_ENV}"
 ```
---context alert_email=your@email.com
-```
 
----
-
-## Context variables reference
-
-All `cdk deploy` commands in this workshop use these context variables. Set them in your shell or pass them directly:
-
-| Variable | Example value | Where used |
+| Variable | Example | Purpose |
 |---|---|---|
-| `env` | `dev` | All stack names |
-| `account` | `123456789012` | CDK environment |
-| `region` | `ap-southeast-1` | CDK environment |
-| `alert_email` | `your@email.com` | SNS subscriptions |
-| `gold_date_filter` | `dt >= '2022-06-01'` | Athena CTAS WHERE clause (demo only) |
+| `CDK_ENV` | `dev` | Appended to all resource names |
+| `CDK_ACCOUNT` | `123456789012` | CDK environment target |
+| `ALERT_EMAIL` | `you@example.com` | SNS anomaly alert destination |
+| `BUCKET` | `ott-search-123456789012-dev` | S3 bucket for all data |
+| `gold_date_filter` | `dt >= '2022-06-01'` | Athena CTAS date scope (historical demo) |
 
-The default `gold_date_filter` is `dt >= date_add('day', -1, current_date)` — for the historical demo dataset, override it to cover all June 2022 data.
+{{% notice warning %}}
+The `gold_date_filter` override is **required** when running the historical June 2022 demo. Without it, the Athena CTAS uses the production default (`dt >= date_add('day', -1, current_date)`) and produces an empty gold table.
+{{% /notice %}}
