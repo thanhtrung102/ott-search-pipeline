@@ -29,15 +29,15 @@ Point to the heatmap:
 
 > "Each cell is the abandonment rate for a content genre × device class combination. Abandonment means: the user typed a search query, got results, and left without clicking anything. A higher abandonment rate means the search results are not relevant."
 
-Point to the darkest cell (UNKNOWN × Android):
+Point to the darkest cell (UNKNOWN × SmartTV):
 
-> "The UNKNOWN category on Android has approximately **19.8% abandonment** — nearly one in five users who typed a free-text search on Android got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
+> "The UNKNOWN category on SmartTV has approximately **30.95% abandonment** — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
 
 Pause.
 
-> "Now look at the genre dimension. THE_THAO × OTTBox is around 1.4% — low abandonment. Sports searches on set-top boxes are resolving well. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
+> "Now look at the genre dimension. THE_THAO × Android is around 4.6% — low abandonment. Sports searches on Android are resolving well. THE_THAO × OTTBox is 8.01%. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
 
-> "A product manager seeing this dashboard files a ticket to expand the genre classifier on Android — not a CDN or search-index bug. Without the pipeline, this signal was buried inside raw event rows that nobody could query. A product team seeing abandonment_rate = 0.198 on UNKNOWN × Android can prioritise classifier work in the next sprint."
+> "A product manager seeing this dashboard files a ticket to expand the genre classifier for SmartTV — not a CDN or search-index bug. Without the pipeline, this signal was buried inside raw event rows that nobody could query. A product team seeing abandonment_rate = 0.3095 on UNKNOWN × SmartTV can prioritise classifier work in the next sprint."
 
 ---
 
@@ -148,7 +148,7 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 > "Every resource in this demo — the VPC, the KMS keys, Kinesis, Firehose, Glue, Step Functions, DynamoDB, SNS, Lake Formation, CloudTrail, GuardDuty, Macie — was deployed from a single CDK command: `cdk deploy --all`. It can be destroyed with `cdk destroy --all`. Total infrastructure cost for this demo run was approximately $9.60, dominated by a one-month QuickSight subscription."
 
-> "The pipeline answers the question we started with: where is the search experience failing? On Android, nearly 20% of free-text searches produce no useful result. The classifier is missing the long tail of search vocabulary. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
+> "The pipeline answers the question we started with: where is the search experience failing? On SmartTV, nearly 31% of free-text searches produce no useful result. The classifier is missing the long tail of search vocabulary on the living-room device class. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
 
 ---
 

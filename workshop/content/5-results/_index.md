@@ -33,7 +33,7 @@ All infrastructure is defined as CDK Python and is reproducible from `cdk deploy
 
 ## What the data revealed
 
-**Free-text search abandonment:** The UNKNOWN category on Android exhibits the highest search abandonment rate at approximately **19.8%** — free-text keyword searches that matched no known content pattern. THE_THAO (sports) × OTTBox is ~1.4%, mid-range relative to other genre × platform pairs. The primary product signal is classifier coverage: the rule-based LUT covers ~44.5% of keyword volume, and the 19.8% abandonment on UNKNOWN Android reflects unresolvable long-tail searches, not a content gap on specific device classes.
+**Free-text search abandonment:** The UNKNOWN category on SmartTV exhibits the highest search abandonment rate at approximately **30.95%** — nearly one in three SmartTV users who typed a free-text search matching no known genre got no useful result and quit. Android × UNKNOWN is **13.83%**. THE_THAO (sports) × OTTBox is **8.01%**, mid-range relative to other genre × platform pairs. The primary product signal is classifier coverage: the rule-based LUT covers ~44.5% of keyword volume, and the high SmartTV abandonment on UNKNOWN reflects unresolvable long-tail searches on the living-room device class, not a content gap on a specific device class.
 
 **Music dominates by normalized volume:** NHAC (music) has 668 keyword slots and 14,371 total searches in the gold layer — the most distinct keyword vocabulary of any genre. Bolero keywords appear consistently across all platform groups, suggesting a broad, cross-demographic audience rather than a specific device-class preference.
 
@@ -55,7 +55,7 @@ The pipeline answers the three questions from the Introduction:
 |---|---|
 | What is trending? | Bolero keywords rising in NHAC/SmartTV; sports search volume concentrated at hours 20–22 |
 | Is something wrong right now? | Z-score alert delivered within 5 minutes of anomaly injection — before any user complaint |
-| Where is the search experience failing? | UNKNOWN × Android has 19.8% abandonment — highest of any genre × platform combination; fix is improving keyword classifier coverage, not device-class content |
+| Where is the search experience failing? | UNKNOWN × SmartTV has 30.95% abandonment — highest by volume-weighted impact; Android × UNKNOWN is 13.83%; fix is improving keyword classifier coverage, not device-class content |
 
 ---
 

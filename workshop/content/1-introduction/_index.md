@@ -23,7 +23,7 @@ This pipeline closes that gap.
 
 ## Why this matters
 
-Sports content (THE_THAO) exhibits **14.3% search abandonment** in the June 2022 dataset — users searching for live football matches on OTTBox set-top boxes type a query, get no useful results, and quit. These are disproportionately K+ premium subscribers — the platform's highest-value users hitting a search index gap for live broadcast content on this device class.
+Free-text searches that match no known genre pattern (the UNKNOWN category) exhibit the highest abandonment on SmartTV at **30.95%** in the June 2022 dataset — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. The overall sports (THE_THAO) abandonment rate is **7.16%**, with OTTBox at **8.01%** — disproportionately K+ premium subscribers hitting a live broadcast content gap.
 
 The pipeline surfaces this within minutes of it occurring, rather than the next morning.
 
