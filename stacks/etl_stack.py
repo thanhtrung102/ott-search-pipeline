@@ -184,6 +184,7 @@ class ETLStack(Stack):
                 "--extra-py-files": (
                     f"s3://{bucket_name}/glue-scripts/genre_classifier.zip"
                 ),
+                "--additional-python-modules": "rapidfuzz>=3.0.0",
             },
             max_retries=1,
             timeout=30,  # minutes

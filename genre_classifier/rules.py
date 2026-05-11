@@ -7,12 +7,13 @@ Three classifiers (§6.4, §6.5, §6.6):
   normalize_network_type(nt)       → network_type_norm (5 values)
 
 classify_keyword waterfall (§6.4):
-  0. _preprocess: collapse spaces, strip episode suffix (tap/ep N), dedupe chars
+  0. _preprocess: collapse spaces (incl. unicode), strip [tag]/paren suffixes,
+                  strip episode suffix (tap/ep N), dedupe chars
   1. LUT exact match (lut.json — curated, ~70 entries)
   2. Extended LUT exact match (lut_extended.json — LLM-built, ~100K entries)
   2b. LUT_EXT no-diacritics match (handles queries typed without Vietnamese marks)
   3. Regex pattern match (covers partial matches and transliterations)
-  4a. Fuzzy LUT match via difflib (cutoff=0.85, keywords ≥4 chars)
+  4a. Fuzzy LUT match via rapidfuzz/difflib (cutoff=0.85, keywords ≥4 chars)
   4b. Fuzzy LUT_EXT multi-word match (cutoff=0.92, keywords ≥8 chars with space)
   5. FastText ML classifier (optional; requires FASTTEXT_MODEL_PATH env var)
   → UNKNOWN for no match; Bedrock fallback applied only in the Glue batch path.
@@ -21,7 +22,13 @@ lut_extended.json is built offline by scripts/build_extended_lut.py and bundled
 into genre_classifier.zip alongside lut.json.  Rebuild when genre distribution
 shifts noticeably (run build_extended_lut.py → commit → rebuild zip → re-upload).
 """
-import difflib as _difflib
+try:
+    from rapidfuzz import process as _rfprocess, fuzz as _rfuzz
+    _RAPIDFUZZ = True
+except ImportError:
+    import difflib as _difflib  # type: ignore[assignment]
+    _RAPIDFUZZ = False
+
 import importlib.resources
 import json
 import re
@@ -63,11 +70,15 @@ _RAW_PATTERNS: dict[str, list[str]] = {
         r"trực tiếp.*vs", r"\bvs\b.*việt nam", r"\bvs\b.*viet nam",
         r"tennis", r"bóng rổ", r"futsal", r"world cup", r"v-?league",
         r"\bk\+\b",          # K+ sports premium channel
+        r"cầu lông", r"cau long", r"bóng chuyền", r"bong chuyen",
+        r"boxing", r"\bmma\b", r"kickboxing", r"võ thuật",
+        r"\bolympic\b", r"thế vận hội", r"the van hoi",
     ],
     "NHAC": [
         r"bolero", r"trữ tình", r"tru tinh", r"nhạc", r"nhac",
         r"ca nhạc", r"ca nhac", r"vpop", r"nhạc trẻ", r"nhạc vàng",
         r"nhac vang", r"remix", r"mv\b",
+        r"k-?pop", r"kpop", r"\bbts\b", r"blackpink", r"\btwice\b",
     ],
     "ANIME": [
         r"\banime\b", r"hoạt hình nhật", r"hoat hinh nhat",
@@ -75,20 +86,27 @@ _RAW_PATTERNS: dict[str, list[str]] = {
         r"chuyển sinh", r"cậu mang", r"học viện anh hùng",
         r"\bdragon ball\b", r"\bsword art online\b", r"\bbleach\b",
         r"\battack on titan\b", r"\bconan\b",
+        r"\bdragon ball\b", r"\bkimetsu\b", r"demon slayer",
+        r"jujutsu kaisen", r"\bjjk\b", r"my hero academia",
+        r"\btokyo ghoul\b", r"\bhaikyuu\b",
     ],
     "TRUYEN_HINH": [
         r"vtv[1-9]", r"htv[1-9]", r"\bkênh\b", r"\bkenh\b",
         r"trực tiếp$", r"truc tiep$", r"\bvtv\b", r"\bhtv\b",
+        r"gameshow", r"game show", r"variety show", r"reality show",
+        r"phát sóng", r"phat song",
     ],
     "PHIM_VIET": [
         r"phim việt", r"phim viet", r"phim bộ việt", r"phim bo viet",
         r"đài truyền hình", r"dai truyen hinh",
-        r"ngôi nhà", r"cô gái", r"chàng trai",
+        # require "phim" prefix to avoid false positives on bare nouns
+        r"phim.*(?:ngôi nhà|ngoi nha|cô gái|co gai|chàng trai|chang trai)",
     ],
     "PHIM_AU_MY": [
         r"\bmarvel\b", r"\bdisney\b", r"\bnetflix\b", r"\bhbo\b",
         r"\bavengers\b", r"\bbatman\b", r"\bspiderman\b", r"\bsuperman\b",
         r"\bstar wars\b", r"\bfast.furious\b",
+        r"\bparamount\b", r"apple tv\+?", r"amazon prime",
     ],
     "PHIM_TRUNG": [
         r"kiếm hiệp", r"kiem hiep", r"cổ trang", r"co trang",
@@ -108,10 +126,11 @@ _COMPILED: dict[str, list[re.Pattern]] = {
     for genre, pats in _RAW_PATTERNS.items()
 }
 
-# Pattern evaluation order — most-selective first to minimise false positives
+# Pattern evaluation order — PHIM_HAN before PHIM_AU_MY (more specific markers);
+# PHIM_VIET last as its patterns are broadest.
 _GENRE_ORDER = [
     "THE_THAO", "ANIME", "NHAC", "TRUYEN_HINH",
-    "PHIM_AU_MY", "PHIM_HAN", "PHIM_TRUNG", "PHIM_VIET",
+    "PHIM_HAN", "PHIM_AU_MY", "PHIM_TRUNG", "PHIM_VIET",
 ]
 
 # Fuzzy match candidates:
@@ -126,27 +145,45 @@ _EPISODE_RE = re.compile(
     r"\s+(?:tap|ep|episode|phan|part)\s*\d+\s*$", re.IGNORECASE
 )
 _REPEAT_RE = re.compile(r"(.)\1{2,}")
+_BRACKET_RE = re.compile(r"^\s*\[[^\]]{1,30}\]\s*")   # strip [VietSub], [ENG] prefixes
+_PAREN_RE = re.compile(r"\s*\([^)]{1,30}\)")           # strip (2024), (phụ đề)
+_UNICODE_WS_RE = re.compile(r"[ ​　]+")  # non-breaking / zero-width spaces
 
 
 def _preprocess(kw: str) -> str:
-    """Normalise keyword before lookup: collapse spaces, strip episode suffix, dedupe chars."""
+    """Normalise keyword before lookup."""
+    kw = _UNICODE_WS_RE.sub(" ", kw)        # exotic whitespace → regular space
     kw = " ".join(kw.split())
+    kw = _BRACKET_RE.sub("", kw)            # [VietSub] title → title
+    kw = _PAREN_RE.sub("", kw)              # title (2024) → title
     kw = _EPISODE_RE.sub("", kw).strip()
-    kw = _REPEAT_RE.sub(r"\1\1", kw)  # keep max 2 repeats to avoid over-collapsing
-    return kw
+    kw = _REPEAT_RE.sub(r"\1\1", kw)        # keep max 2 repeats to avoid over-collapsing
+    return kw.strip()
 
 
 import os as _os
 # Set GENRE_CLASSIFIER_FAST=1 in Glue to skip stage 4b (Nova fallback covers it there).
 _FAST_MODE: bool = _os.environ.get("GENRE_CLASSIFIER_FAST", "0") == "1"
 
-# FastText model — optional Stage 3; degrades to UNKNOWN if unavailable
+# FastText model — optional Stage 5; degrades to UNKNOWN if unavailable
 try:
     from genre_classifier.fasttext_model import predict_genre as _ft_predict
     _FASTTEXT_AVAILABLE = True
 except Exception:
     _FASTTEXT_AVAILABLE = False
     _ft_predict = None  # type: ignore[assignment]
+
+
+def _fuzzy_lookup(kw: str, candidates: list[str], cutoff_pct: float) -> str | None:
+    """Return best fuzzy match from candidates, or None. cutoff_pct is 0–100."""
+    if _RAPIDFUZZ:
+        result = _rfprocess.extractOne(
+            kw, candidates, scorer=_rfuzz.token_set_ratio, score_cutoff=cutoff_pct
+        )
+        return result[0] if result else None
+    # difflib fallback (cutoff is 0.0–1.0)
+    matches = _difflib.get_close_matches(kw, candidates, n=1, cutoff=cutoff_pct / 100)
+    return matches[0] if matches else None
 
 
 def classify_keyword(keyword_norm: str | None) -> str:
@@ -186,18 +223,18 @@ def classify_keyword(keyword_norm: str | None) -> str:
         if any(p.search(kw) for p in _COMPILED[g]):
             return g
 
-    # 4a. Fuzzy match against curated LUT (cutoff=0.85, length ≥4)
+    # 4a. Fuzzy match against curated LUT (cutoff=85, length ≥4)
     if len(kw) >= 4:
-        matches = _difflib.get_close_matches(kw, _LUT_KEYS, n=1, cutoff=0.85)
-        if matches:
-            return LUT[matches[0]]
+        match = _fuzzy_lookup(kw, _LUT_KEYS, 85)
+        if match:
+            return LUT[match]
 
-    # 4b. Fuzzy match against multi-word LUT_EXT subset (cutoff=0.92, length ≥8)
+    # 4b. Fuzzy match against multi-word LUT_EXT subset (cutoff=92, length ≥8)
     #     Skipped when GENRE_CLASSIFIER_FAST=1 (Glue batch path — Nova fallback covers it).
     if len(kw) >= 8 and " " in kw and not _FAST_MODE:
-        matches = _difflib.get_close_matches(kw, _LUT_EXT_FUZZY_KEYS, n=1, cutoff=0.92)
-        if matches:
-            return LUT_EXT[matches[0]]
+        match = _fuzzy_lookup(kw, _LUT_EXT_FUZZY_KEYS, 92)
+        if match:
+            return LUT_EXT[match]
 
     # 5. FastText ML classifier — optional, requires trained model binary
     if _FASTTEXT_AVAILABLE and _ft_predict is not None:
