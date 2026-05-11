@@ -300,6 +300,19 @@ class IngestionStack(Stack):
                                       "arn:aws:s3:::PLACEHOLDER/*"]
                             ),
                         ),
+                        # Required when NOVA_FALLBACK_ENABLED=1; harmless otherwise.
+                        iam.PolicyStatement(
+                            actions=["s3:GetObject", "s3:PutObject"],
+                            resources=(
+                                [bucket.arn_for_objects("glue-scripts/lut_extended.json")]
+                                if bucket
+                                else ["arn:aws:s3:::PLACEHOLDER/glue-scripts/lut_extended.json"]
+                            ),
+                        ),
+                        iam.PolicyStatement(
+                            actions=["bedrock:InvokeModel"],
+                            resources=["arn:aws:bedrock:ap-southeast-1::foundation-model/amazon.nova-micro-v1:0"],
+                        ),
                     ]
                 )
             },
