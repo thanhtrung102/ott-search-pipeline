@@ -6,7 +6,7 @@ pre: "<b>4.6 </b>"
 
 ## Context
 
-QuickSight connects to Athena via the `ott-analytics-dev` workgroup. The `keyword_trends` dataset is imported into SPICE — a columnar in-memory store that enables sub-second response without scanning S3 on every interaction. SPICE refreshes daily at 03:00 UTC+7, one hour after Step Functions completes.
+QuickSight connects to Athena via the `ott-analytics-demo` workgroup. The `keyword_trends` dataset is imported into SPICE — a columnar in-memory store that enables sub-second response without scanning S3 on every interaction. SPICE refreshes daily at 03:00 UTC+7, one hour after Step Functions completes.
 
 {{% notice info %}}
 QuickSight Standard cannot be provisioned via CDK. This section documents manual console steps. Complete Prerequisites Step 10 (QuickSight sign-up) before starting.
@@ -18,13 +18,13 @@ QuickSight Standard cannot be provisioned via CDK. This section documents manual
 
 1. **QuickSight → Datasets → New dataset**
 2. Choose **Athena**
-3. Data source name: `ott-analytics-dev`
-4. Workgroup: `ott-analytics-dev`
+3. Data source name: `ott-analytics-demo`
+4. Workgroup: `ott-analytics-demo`
 5. Click **Create data source**
 6. Database: `ott_search_gold` → Table: `keyword_trends`
 7. Choose **Import to SPICE** → **Visualize**
 
-SPICE import takes ~2 minutes for 4,761 rows.
+SPICE import takes ~2 minutes for 6,908 rows.
 
 ---
 
@@ -36,13 +36,13 @@ SPICE import takes ~2 minutes for 4,761 rows.
 - **Values:** `abandonment_rate` (Average)
 - **Conditional formatting:** Blue gradient — darker = higher abandonment
 
-**Verified insight:** UNKNOWN × SmartTV is the darkest cell at **~30.95% abandonment**. UNKNOWN × Android is second at **~13.83%**. THE_THAO × OTTBox is **~8.0%**. The primary signal is classifier coverage: the rule-based LUT classifies ~44.5% of keyword volume; the 55.5% falling to UNKNOWN drives the high SmartTV abandonment.
+**Verified insight:** UNKNOWN × SmartTV is the darkest cell at **~30.87% abandonment**. UNKNOWN × Android is second at **~13.91%**. THE_THAO × OTTBox is **~6.2%**. The primary signal is classifier coverage: the rule-based LUT classifies ~43.5% of keyword volume; the 56.5% falling to UNKNOWN drives the high SmartTV abandonment.
 
 {{% notice tip %}}
 **📸 Screenshot 1:** Capture the heatmap with all genre × platform cells visible. UNKNOWN × SmartTV must be the darkest cell. Save as `workshop/static/images/4.6-quality-profile.png`.
 {{% /notice %}}
 
-Caption: "UNKNOWN × SmartTV shows ~30.95% search abandonment — nearly 1-in-3 SmartTV free-text searches produce no useful result. The failure is classifier coverage, not a device-specific content gap: the search index has the content, but the classifier cannot map the free-text query to it."
+Caption: "UNKNOWN × SmartTV shows ~30.87% search abandonment — nearly 1-in-3 SmartTV free-text searches produce no useful result. The failure is classifier coverage, not a device-specific content gap: the search index has the content, but the classifier cannot map the free-text query to it."
 
 ---
 
@@ -59,7 +59,7 @@ Caption: "UNKNOWN × SmartTV shows ~30.95% search abandonment — nearly 1-in-3 
 ifelse(rank_delta > 0, "↑", ifelse(rank_delta < 0, "↓", "→"))
 ```
 
-**Verified insight (NHAC × SmartTV):** NHAC has 668 distinct keyword slots — the most diverse search vocabulary of any genre. Bolero keywords consistently rank at the top across all platform groups. Keywords with `rank_7d_ago = 9999` are new entrants — they did not appear in the top 50 seven days prior.
+**Verified insight (NHAC × SmartTV):** NHAC has 392 distinct keyword slots — the most diverse search vocabulary of any genre. Bolero keywords consistently rank at the top across all platform groups. Keywords with `rank_7d_ago = 9999` are new entrants — they did not appear in the top 50 seven days prior.
 
 {{% notice tip %}}
 **📸 Screenshot 2:** Set filters `derived_genre=NHAC`, `platform_group=SmartTV`. Capture the bar chart showing bolero keywords at top, with rank delta indicators visible. Save as `workshop/static/images/4.6-leaderboard.png`.
@@ -136,17 +136,17 @@ aws athena start-query-execution \
   --query QueryExecutionId --output text
 ```
 
-**Verified genre distribution (2026-05-08):**
+**Verified genre distribution (2026-05-10):**
 
 | derived_genre | keyword_slots | total_searches |
 |---|---|---|
-| UNKNOWN | 560 | 97,451 |
-| ANIME | 519 | 26,060 |
-| NHAC | 668 | 14,371 |
-| TRUYEN_HINH | 616 | 11,525 |
-| THE_THAO | 615 | 11,209 |
-| PHIM_VIET | 777 | 6,532 |
-| PHIM_AU_MY | 587 | 4,532 |
-| PHIM_TRUNG | 419 | 3,860 |
+| UNKNOWN | 701 | 43,884 |
+| ANIME | 545 | 11,795 |
+| NHAC | 1,420 | 5,899 |
+| TRUYEN_HINH | 924 | 5,474 |
+| THE_THAO | 1,021 | 3,965 |
+| PHIM_VIET | 735 | 2,599 |
+| PHIM_TRUNG | 644 | 2,072 |
+| PHIM_AU_MY | 918 | 2,052 |
 
-UNKNOWN accounts for 55.5% of total searches — 97,451 out of ~175,540. This is the honest classifier coverage number. NHAC has the most distinct keyword slots (668) despite lower total search volume than ANIME.
+UNKNOWN accounts for 56.5% of total searches — 43,884 out of ~77,740. This is the honest classifier coverage number. NHAC has the most distinct keywords (392) despite lower total search volume than ANIME and UNKNOWN.

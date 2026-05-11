@@ -26,15 +26,15 @@ This pipeline closes that gap with two paths built on the same Kinesis stream:
 
 ## Key findings from the data
 
-All figures verified against the `demo` environment on **2026-05-08**:
+All figures verified against the `demo` environment on **2026-05-10**:
 
 | Finding | Value |
 |---|---|
-| Highest abandonment | **UNKNOWN × SmartTV: 30.95%** — nearly 1-in-3 SmartTV free-text searches produce no useful result |
-| Second-highest abandonment | UNKNOWN × Android: 13.83% |
-| Sports (THE_THAO) overall | 7.16% abandonment; OTTBox: 8.01%; Android: 4.63% |
-| Classifier coverage | Rule-based LUT covers ~44.5% of keyword volume; 55.5% falls to UNKNOWN |
-| Music keyword diversity | NHAC: 668 distinct keyword slots in gold layer — highest of any genre |
+| Highest abandonment | **UNKNOWN × SmartTV: 30.87%** — nearly 1-in-3 SmartTV free-text searches produce no useful result |
+| Second-highest abandonment | UNKNOWN × Android: 13.91% |
+| Sports (THE_THAO) overall | 7.02% abandonment; OTTBox: 6.16%; Android: 5.51% |
+| Classifier coverage | Rule-based LUT covers ~43.5% of keyword volume; 56.5% falls to UNKNOWN |
+| Music keyword diversity | NHAC: 392 distinct keyword slots in gold layer — highest of any genre |
 
 The primary signal: the UNKNOWN × SmartTV abandonment is a **classifier coverage problem**, not a content gap. The search index has the content; the classifier cannot map the free-text query to it. This pipeline makes that visible within minutes of occurrence.
 
@@ -62,16 +62,16 @@ S3 raw/events/           DynamoDB ott-anomaly-events
  dt/hour/genre/platform) (≤ 5 min latency)
     │
     ▼
-Glue Crawler → Glue ETL (18-step enrichment, 260s)
+Glue Crawler → Glue ETL (18-step enrichment, ~200s)
     │
     ▼
-S3 curated/search_enriched/ (1,334,620 records)
+S3 curated/search_enriched/ (992,650 records)
     │
     ▼
-Step Functions → Athena CTAS (10m 10s total)
+Step Functions → Athena CTAS (~12 min total)
     │
     ▼
-S3 gold/keyword_trends/ (4,761 rows) → QuickSight
+S3 gold/keyword_trends/ (6,908 rows) → QuickSight
 ```
 
 All infrastructure is CDK Python. Reproducible from `cdk deploy --all` in under 15 minutes.

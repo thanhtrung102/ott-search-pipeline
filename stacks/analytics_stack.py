@@ -89,20 +89,21 @@ ranked_7d AS (
       ORDER BY COUNT(*) FILTER (WHERE session_action = 'enter') DESC
     ) AS rank_7d_ago
   FROM ott_search_curated.search_enriched
-  WHERE dt BETWEEN DATE_ADD('day', -8, CURRENT_DATE)
-                AND DATE_ADD('day', -2, CURRENT_DATE)
+  WHERE dt BETWEEN CAST(DATE_ADD('day', -8, CURRENT_DATE) AS VARCHAR)
+                AND CAST(DATE_ADD('day', -2, CURRENT_DATE) AS VARCHAR)
     AND keyword_norm IS NOT NULL
     AND is_cross_partition_date = false
   GROUP BY 1, 2, 3
 )
 SELECT
-  t.trend_date, t.derived_genre, t.platform_group, t.network_type_norm,
+  t.platform_group, t.network_type_norm,
   t.isp_segment, t.keyword_norm, t.search_count, t.enter_count,
   t.abandonment_rate, t.unique_users, t.authenticated_rate,
   t.repeat_search_rate, t.premium_search_rate,
   t.rank_today,
   COALESCE(h.rank_7d_ago, 9999)               AS rank_7d_ago,
-  COALESCE(h.rank_7d_ago, 9999) - t.rank_today AS rank_delta
+  COALESCE(h.rank_7d_ago, 9999) - t.rank_today AS rank_delta,
+  t.trend_date, t.derived_genre
 FROM ranked_today t
 LEFT JOIN ranked_7d h
   ON  t.derived_genre  = h.derived_genre

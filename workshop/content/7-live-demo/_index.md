@@ -15,7 +15,7 @@ A **10–15 minute** walkthrough of the four QuickSight dashboards plus one term
 
 ## Opening (1 minute)
 
-> "FPT Play has approximately 82,350 search events per day from June 2022 — across sports, music, anime, drama, and Vietnamese film. This pipeline answers three questions the raw event data cannot: **what is trending, what is anomalous, and where is the search experience failing.** I will show you the answer to each question — starting with the most important one."
+> "FPT Play has approximately 81,928 search events per day from June 2022 — across sports, music, anime, drama, and Vietnamese film. This pipeline answers three questions the raw event data cannot: **what is trending, what is anomalous, and where is the search experience failing.** I will show you the answer to each question — starting with the most important one."
 
 Navigate to the **Search Quality Profile** dashboard (lead with the insight, not the data volume).
 
@@ -29,11 +29,11 @@ Navigate to the **Search Quality Profile** dashboard (lead with the insight, not
 
 Point to the darkest cell (UNKNOWN × SmartTV):
 
-> "The UNKNOWN category on SmartTV has **30.95% abandonment** — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
+> "The UNKNOWN category on SmartTV has **30.87% abandonment** — nearly one in three users who typed a free-text search on a Smart TV got no useful result and quit. UNKNOWN means the keyword did not match any genre in the classifier: no bolero lookup hit, no sports term regex, nothing. These are searches the platform cannot answer."
 
 Pause.
 
-> "Now look at the genre dimension. THE_THAO × Android is around 4.6% — low abandonment. Sports searches on Android are resolving well. THE_THAO × OTTBox is 8.0%. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
+> "Now look at the genre dimension. THE_THAO × Android is around 5.5% — low abandonment. Sports searches on Android are resolving well. THE_THAO × OTTBox is 6.2%. The failure is **classifier coverage**, not a content gap on a specific device class. The search index has the content — the classifier cannot map the free-text query to it."
 
 > "A product manager seeing this dashboard files a ticket to expand the genre classifier — not a CDN or search-index bug. Without the pipeline, this signal was buried inside raw event rows that nobody could query. A product team seeing abandonment_rate = 0.31 on UNKNOWN × SmartTV can prioritise classifier work in the next sprint."
 
@@ -61,7 +61,7 @@ Show the reference lines at ±3.0:
 
 **Switch to the keyword leaderboard. Set filters: `derived_genre = NHAC`, `platform_group = SmartTV`.**
 
-> "Music (NHAC) is the highest-volume genre by distinct keyword count — 668 unique search terms in 14 days. Bolero keywords consistently rank at the top across all platform groups."
+> "Music (NHAC) is the highest-volume genre by distinct keyword count — 392 unique search terms in 14 days. Bolero keywords consistently rank at the top across all platform groups."
 
 Point to a keyword with a positive `rank_delta`:
 
@@ -92,13 +92,18 @@ Point to a keyword with `rank_7d_ago = 9999`:
 ```bash
 # Assume the Marketing role
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-ENV=${CDK_ENV:-dev}
-read -r KEY SECRET TOKEN < <(aws sts assume-role \
+ENV=${CDK_ENV:-demo}
+eval $(aws sts assume-role \
   --role-arn "arn:aws:iam::${ACCOUNT}:role/ott-marketing-${ENV}" \
   --role-session-name live-demo \
-  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-  --output text)
-export AWS_ACCESS_KEY_ID=$KEY AWS_SECRET_ACCESS_KEY=$SECRET AWS_SESSION_TOKEN=$TOKEN
+  --query 'Credentials' \
+  --output json | python3 -c "
+import json,sys
+c=json.load(sys.stdin)
+print(f'export AWS_ACCESS_KEY_ID={c[\"AccessKeyId\"]}')
+print(f'export AWS_SECRET_ACCESS_KEY={c[\"SecretAccessKey\"]}')
+print(f'export AWS_SESSION_TOKEN={c[\"SessionToken\"]}')
+")
 BUCKET="ott-search-${ACCOUNT}-${ENV}"
 
 # Attempt 1: query curated layer — WILL FAIL
@@ -129,6 +134,8 @@ QID=$(aws athena start-query-execution \
 sleep 10
 aws athena get-query-results --query-execution-id $QID \
   --query "ResultSet.Rows[*].Data[*].VarCharValue" --output json
+# Note: On Windows, this may print a charmap encoding error for Vietnamese characters.
+# Verify success via: aws athena get-query-execution --query-execution-id $QID --query 'QueryExecution.Status.State' --output text
 
 # Restore credentials
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
@@ -144,7 +151,7 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 > "Every resource in this demo — VPC, KMS keys, Kinesis, Firehose, Glue, Step Functions, DynamoDB, SNS, Lake Formation, CloudTrail, GuardDuty, Macie — was deployed from a single CDK command: `cdk deploy --all`. It can be destroyed with `cdk destroy --all`. Total infrastructure cost for this demo run was approximately **$9.60**, dominated by a one-month QuickSight subscription."
 
-> "The pipeline answers the question we started with: where is the search experience failing? On SmartTV, **nearly 31% of free-text searches produce no useful result**. The classifier is missing the long tail of search vocabulary on the living-room device class. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
+> "The pipeline answers the question we started with: where is the search experience failing? On SmartTV, **nearly 31% of free-text searches produce no useful result** (30.87%). The classifier is missing the long tail of search vocabulary on the living-room device class. This dashboard makes that visible in under 5 minutes — and points directly at the fix."
 
 ---
 
@@ -152,7 +159,7 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 | Question | Answer |
 |---|---|
-| How accurate is the genre classifier? | UNKNOWN = 55.5% of keywords. Honest, not a failure. LLM fallback handles long tail in production. |
+| How accurate is the genre classifier? | UNKNOWN = 56.5% of keywords. Honest, not a failure. LLM fallback handles long tail in production. |
 | What happens if Glue fails? | Step Functions → PipelineFailure state → SNS → CloudWatch composite alarm fires within 26h. Next run reprocesses via predicate. |
 | Why Kinesis instead of just Glue on S3? | Anomaly detection needs ≤5 min latency. Glue startup alone is 5–10 min. Kinesis delivers to Lambda in seconds. |
 | Why PySpark native writer instead of Glue DynamicFrame? | Raw Parquet embeds `derived_genre` as both a data column and partition path. DynamicFrame raises `COLUMN_ALREADY_EXISTS`. PySpark DataFrameReader with explicit schema and basePath avoids this. |

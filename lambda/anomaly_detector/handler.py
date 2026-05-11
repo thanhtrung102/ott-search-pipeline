@@ -77,19 +77,22 @@ def _batch_get_baselines(
     """Fetch all (mean, std) for the given (genre, hour) keys in one batch request."""
     if not keys:
         return {}
-    request_keys = [{"genre_hour": {"S": f"{g}#{h}"}} for g, h in keys]
-    resp = _dynamodb.meta.client.batch_get_item(
-        RequestItems={table.name: {"Keys": [{"genre_hour": {"S": f"{g}#{h}"}} for g, h in keys]}}
-    )
-    result: dict[tuple[str, int], tuple[float, float]] = {}
-    for item in resp.get("Responses", {}).get(table.name, []):
-        gh = item["genre_hour"]["S"]
-        genre, _, hour_str = gh.partition("#")
-        result[(genre, int(hour_str))] = (
-            float(item.get("rolling_mean", {}).get("N", 0)),
-            float(item.get("rolling_std",  {}).get("N", 0)),
+    # Use resource-level batch_get_item (no type descriptors; resource handles serialization).
+    # resource.meta.client re-serializes typed DynamoDB format, causing ValidationException.
+    all_results: dict[tuple[str, int], tuple[float, float]] = {}
+    for chunk_start in range(0, len(keys), 100):
+        chunk = keys[chunk_start:chunk_start + 100]
+        resp = _dynamodb.batch_get_item(
+            RequestItems={table.name: {"Keys": [{"genre_hour": f"{g}#{h}"} for g, h in chunk]}}
         )
-    return result
+        for item in resp.get("Responses", {}).get(table.name, []):
+            gh = item["genre_hour"]
+            genre, _, hour_str = gh.partition("#")
+            all_results[(genre, int(hour_str))] = (
+                float(item.get("rolling_mean", 0)),
+                float(item.get("rolling_std",  0)),
+            )
+    return all_results
 
 
 def _put_anomaly(

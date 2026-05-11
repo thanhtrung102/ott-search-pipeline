@@ -25,14 +25,14 @@ anomaly-detector Lambda         Kinesis Firehose → S3 raw/events/
 (z-score vs DynamoDB baseline)  (JSON→Parquet, dynamic partitioning)
     │                               │
     ▼                               ▼
-DynamoDB ott-anomaly-events     Glue Crawler + Glue ETL (18 steps, 260s)
-EventBridge → SNS email         S3 curated/search_enriched/ (1,334,620 rows)
+DynamoDB ott-anomaly-events     Glue Crawler + Glue ETL (18 steps, ~200s)
+EventBridge → SNS email         S3 curated/search_enriched/ (992,650 rows)
 ≤ 5 min alert latency               │
                                     ▼
-                             Step Functions (01:30 UTC+7 daily, 10m10s)
+                             Step Functions (01:30 UTC+7 daily, ~12 min)
                                     │
                                     ▼
-                             Athena CTAS → S3 gold/keyword_trends/ (4,761 rows)
+                             Athena CTAS → S3 gold/keyword_trends/ (6,908 rows)
                              QuickSight SPICE (4 dashboards, refresh 03:00)
 ```
 

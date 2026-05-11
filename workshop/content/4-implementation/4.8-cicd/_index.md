@@ -8,8 +8,8 @@ pre: "<b>4.8 </b>"
 
 **OttObservability:**
 - CloudWatch custom metric namespace `OTT/SearchPipeline`
-- 4 CloudWatch alarms + 1 composite alarm `pipeline-health-dev`
-- CloudWatch dashboard `ott-pipeline-health-dev`
+- 4 CloudWatch alarms + 1 composite alarm `ott-pipeline-health-demo`
+- CloudWatch dashboard `ott-pipeline-health-demo`
 
 **OttPipeline:**
 - CodePipeline CI/CD with 6 stages (Source → Build → Deploy_Dev → Integration_Test → Manual_Approval → Deploy_Prod)
@@ -29,38 +29,44 @@ cdk deploy OttObservability-${CDK_ENV} OttPipeline-${CDK_ENV} \
   --require-approval never
 ```
 
-**Deploy time:** approximately 10 minutes. CodePipeline requires a one-time CodeStar Connection setup (see below).
+**Deploy time:** approximately 10 minutes. After deploy, push code to the CodeCommit remote (see Source configuration below) to activate the pipeline.
 
 ---
 
-## CodeStar Connection (one-time manual step)
+## Source configuration
+
+The pipeline stack selects the source provider based on CDK context:
+
+- **With** `github_owner` + `github_repo` + `github_connection` context → GitHub via CodeStar Connection
+- **Without** those context keys (default) → CodeCommit fallback (repo auto-created as `ott-search-pipeline-{env}`)
+
+The demo deployment uses **CodeCommit** (no GitHub context provided).
+
+### Push code to CodeCommit to activate the pipeline
 
 ```bash
-# After deploy, the Source stage will show "Failed - Action execution failed"
-# until the connection is authorized. Do this once:
+# Add the CodeCommit remote (one-time)
+git remote add codecommit \
+  https://git-codecommit.ap-southeast-1.amazonaws.com/v1/repos/ott-search-pipeline-${CDK_ENV}
+
+# Configure git to use AWS CLI credential helper
+git config credential.helper '!aws codecommit credential-helper $@'
+git config credential.UseHttpPath true
+
+# Push — this triggers the Source stage immediately
+GIT_ASKPASS="" GIT_TERMINAL_PROMPT=0 git push codecommit main
 ```
 
-1. **Developer Tools Console → Connections → Find `ott-github-connection`**
-2. Status shows **Pending** — click **Update pending connection**
-3. **Connect to GitHub** → authorize the app → **Connect**
-4. Status changes to **Available**
+### Optional: use GitHub instead
 
-Then update `cdk.json`:
-```json
-{
-  "context": {
-    "github_connection_arn": "arn:aws:codestar-connections:ap-southeast-1:{account}:connection/xxxxxxxx",
-    "github_owner": "thanhtrung102",
-    "github_repo": "ott-search-pipeline"
-  }
-}
-```
-
-Re-deploy OttPipeline to pick up the connection ARN:
+To switch to GitHub, create a CodeStar Connection in the console, then re-deploy with the extra context:
 ```bash
 cdk deploy OttPipeline-${CDK_ENV} \
   --context env=${CDK_ENV} \
   --context account=${CDK_ACCOUNT} \
+  --context github_owner=<your-github-username> \
+  --context github_repo=ott-search-pipeline \
+  --context github_connection=arn:aws:codestar-connections:ap-southeast-1:{account}:connection/xxxxxxxx \
   --require-approval never
 ```
 
@@ -78,11 +84,11 @@ cdk deploy OttPipeline-${CDK_ENV} \
 
 | Alarm | Threshold | Meaning |
 |---|---|---|
-| `ott-lambda-error-rate-dev` | Lambda errors > 5 in 5 min | Lambda function failing |
-| `ott-kinesis-iterator-age-dev` | Iterator age > threshold in 5 min | Kinesis consumer falling behind |
-| `ott-glue-job-failure-dev` | DailyPipelineSuccess < 1 in 26h | Nightly pipeline did not complete |
-| `ott-anomaly-score-breach-dev` | AnomalyScore > 3.0 | Z-score exceeded threshold |
-| **`pipeline-health-dev`** | **Composite alarm** | OR of all 4 above |
+| `ott-lambda-error-rate-demo` | Lambda errors > 5 in 5 min | Lambda function failing |
+| `ott-kinesis-iterator-age-demo` | Iterator age > threshold in 5 min | Kinesis consumer falling behind |
+| `ott-glue-job-failure-demo` | DailyPipelineSuccess < 1 in 26h | Nightly pipeline did not complete |
+| `ott-anomaly-score-breach-demo` | AnomalyScore > 3.0 | Z-score exceeded threshold |
+| **`ott-pipeline-health-demo`** | **Composite alarm** | OR of all 4 above |
 
 ---
 
@@ -94,6 +100,7 @@ After the Step Functions run (Section 4.5), verify the metric was published:
 aws cloudwatch get-metric-statistics \
   --namespace OTT/SearchPipeline \
   --metric-name DailyPipelineSuccess \
+  --dimensions Name=Environment,Value=${CDK_ENV} \
   --start-time $(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S) \
   --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
   --period 86400 \
@@ -102,7 +109,9 @@ aws cloudwatch get-metric-statistics \
   --output text
 ```
 
-**Verified output (2026-05-08):** `1.0`
+Note: `date -u -d '...'` requires GNU date (Linux / Cloud9). On macOS use `date -u -v-24H +%Y-%m-%dT%H:%M:%S`.
+
+**Verified output (2026-05-10):** `1.0` (1 successful pipeline run — the scheduled nightly run. Value increments by 1 per successful run on the same day.)
 
 ---
 
@@ -112,7 +121,8 @@ aws cloudwatch get-metric-statistics \
 # Make a small change to trigger the pipeline
 git add stacks/compute_stack.py
 git commit -m "doc: note z-score threshold rationale"
-git push origin main
+GIT_ASKPASS="" GIT_TERMINAL_PROMPT=0 git push codecommit main
+# (replace codecommit with origin if using GitHub source)
 ```
 
 Monitor:
@@ -135,18 +145,21 @@ Expected (after full run):
 |  Deploy_Dev           |  Succeeded |
 |  Integration_Test     |  Succeeded |
 |  Manual_Approval      |  InProgress|
-|  Deploy_Prod          |  (pending) |
+|  Deploy_Prod          |  None      |
 +-----------------------+------------+
 ```
 
 cfn-nag output in Build stage logs (look for):
 ```
-Running cfn_nag_scan...
-Analyzing CloudFormation template cdk.out/OttNetwork-dev.template.json
-------------------------------------------------------------
-0 suppressed violations
-0 violations found
+cdk.out/OttNetwork-dev.template.json
+| WARN W28
+| WARN W29
+| WARN W60
+Failures count: 0
+Warnings count: 5
 ```
+
+`Failures count: 0` on every template means no policy violations. Warnings (W-codes) are advisory only; the buildspec uses `|| true` so warnings do not fail the pipeline. The templates are synthesized as `-dev` (CDK default env) because the buildspec runs `cdk synth --all` without a context env override.
 
 ---
 
@@ -155,17 +168,17 @@ Analyzing CloudFormation template cdk.out/OttNetwork-dev.template.json
 ```bash
 # Force the composite alarm into ALARM state
 aws cloudwatch set-alarm-state \
-  --alarm-name ott-lambda-error-rate-${CDK_ENV} \
+  --alarm-name ott-lambda-error-rate-demo \
   --state-value ALARM \
   --state-reason "Manual test for workshop demo"
 ```
 
-Navigate to: **CloudWatch → Alarms → `pipeline-health-dev`** — composite alarm turns red.
+Navigate to: **CloudWatch → Alarms → `ott-pipeline-health-demo`** — composite alarm turns red.
 
 ```bash
 # Reset after capturing screenshot
 aws cloudwatch set-alarm-state \
-  --alarm-name ott-lambda-error-rate-${CDK_ENV} \
+  --alarm-name ott-lambda-error-rate-demo \
   --state-value OK \
   --state-reason "Resetting after demo"
 ```
@@ -178,40 +191,40 @@ aws cloudwatch set-alarm-state \
 
 | Resource | Name | Configuration |
 |---|---|---|
-| CloudWatch Dashboard | `ott-pipeline-health-dev` | 5 metric widgets |
-| CloudWatch Alarm | `ott-lambda-error-rate-dev` | Errors > 5 in 5 min |
-| CloudWatch Alarm | `ott-kinesis-iterator-age-dev` | Iterator age threshold |
-| CloudWatch Alarm | `ott-glue-job-failure-dev` | DailyPipelineSuccess < 1 in 26h window |
-| CloudWatch Alarm | `ott-anomaly-score-breach-dev` | AnomalyScore > 3.0 |
-| Composite Alarm | `pipeline-health-dev` | OR of all 4 child alarms |
+| CloudWatch Dashboard | `ott-pipeline-health-demo` | 5 metric widgets |
+| CloudWatch Alarm | `ott-lambda-error-rate-demo` | Errors > 5 in 5 min |
+| CloudWatch Alarm | `ott-kinesis-iterator-age-demo` | Iterator age threshold |
+| CloudWatch Alarm | `ott-glue-job-failure-demo` | DailyPipelineSuccess < 1 in 26h window |
+| CloudWatch Alarm | `ott-anomaly-score-breach-demo` | AnomalyScore > 3.0 |
+| Composite Alarm | `ott-pipeline-health-demo` | OR of all 4 child alarms |
 
 ### OttPipeline
 
 | Stage | Tool | Action |
 |---|---|---|
-| Source | CodeStar Connection | GitHub push → artifact |
-| Build | CodeBuild | `cdk synth` + `cfn_nag_scan` (fails on violations) |
-| Deploy_Dev | CloudFormation | `cdk deploy --all` to dev |
-| Integration_Test | CodeBuild | `pytest tests/integration/` |
+| Source | CodeCommit (default) or GitHub via CodeStar Connection | Push to `main` → artifact |
+| Build | CodeBuild (`ott-cdk-synth-{env}`) | `cdk synth` + `pytest` + `cfn_nag_scan` |
+| Deploy_Dev | CloudFormation | Deploy `OttNetwork-dev` to dev environment |
+| Integration_Test | CodeBuild (`ott-integration-test-{env}`) | `pytest tests/integration/` |
 | Manual_Approval | SNS | Gate before production deploy |
-| Deploy_Prod | CloudFormation | `cdk deploy --all` to prod |
+| Deploy_Prod | CloudFormation | Deploy `OttNetwork-prod` to prod environment |
 
 ---
 
 ## Screenshot guidance
 
 **Screenshot 1 — CodePipeline all stages**
-Navigate to: **CodePipeline Console → `ott-search-pipeline-dev`**.
+Navigate to: **CodePipeline Console → `ott-search-pipeline-demo`**.
 Capture all 6 stages with Source, Build, Deploy_Dev, Integration_Test showing Succeeded.
 Save as `workshop/static/images/4.8-codepipeline.png`.
 
 **Screenshot 2 — cfn-nag output in CodeBuild logs**
 Click the Build stage → View logs. Find the `cfn_nag_scan` section.
-Capture the `0 violations found` output with at least one template filename visible.
+Capture the `Failures count: 0` output with at least one template filename visible (e.g. `cdk.out/OttNetwork-dev.template.json`).
 Save as `workshop/static/images/4.8-cfnnag.png`.
 
 **Screenshot 3 — CloudWatch dashboard**
-Navigate to: **CloudWatch → Dashboards → `ott-pipeline-health-dev`** → Last 24 hours.
+Navigate to: **CloudWatch → Dashboards → `ott-pipeline-health-demo`** → Last 24 hours.
 All 5 metric widgets must show data (not empty). AnomalyScore widget should show the THE_THAO spike.
 Save as `workshop/static/images/4.8-cw-dashboard.png`.
 

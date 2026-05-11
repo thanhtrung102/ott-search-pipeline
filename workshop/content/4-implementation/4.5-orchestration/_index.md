@@ -6,8 +6,8 @@ pre: "<b>4.5 </b>"
 
 ## What this deploys
 
-- **Step Functions state machine** `ott-daily-pipeline-dev` — nightly orchestrator, scheduled 01:30 UTC+7 (18:30 UTC), 3-hour timeout
-- **Athena Workgroup** `ott-analytics-dev` — 10 GB scan cap, SSE-S3 query results
+- **Step Functions state machine** `ott-daily-pipeline-demo` — nightly orchestrator, scheduled 01:30 UTC+7 (18:30 UTC), 3-hour timeout
+- **Athena Workgroup** `ott-analytics-demo` — 10 GB scan cap, SSE-S3 query results
 - **Glue Database** `ott_search_gold` — catalog for keyword_trends gold table
 - **EventBridge Rule** — daily 18:30 UTC trigger
 
@@ -56,7 +56,10 @@ RepairCuratedTable (MSCK REPAIR TABLE)
 DropGoldTable (DROP TABLE IF EXISTS ott_search_gold.keyword_trends)
     │
     ▼
-RunAthenaGoldCTAS (CREATE TABLE ... AS SELECT ...)
+RunAthenaGoldCTAS (CREATE TABLE ... AS SELECT ... WHERE trend_date <= '2022-06-10')
+    │
+    ▼
+InsertGoldBatch2 (INSERT INTO ... WHERE trend_date > '2022-06-10')
     │
     ▼
 InvokeBaselineUpdater (.waitForTaskToken)
@@ -69,6 +72,8 @@ Any state (except `StartCrawler`) routes to `PipelineFailure` on error, which pu
 
 **Why `DropGoldTable` before CTAS?** Athena CTAS fails if the target table exists. Dropping first makes the pipeline idempotent — re-runnable on the same day without manual cleanup.
 
+**Why two gold states (`RunAthenaGoldCTAS` + `InsertGoldBatch2`)?** Athena enforces a hard limit of 100 simultaneous partition writers per CTAS. With 14 dates × 8 genres = 112 partitions, a single CTAS exceeds this limit and fails with `HIVE_TOO_MANY_OPEN_PARTITIONS`. The fix splits the write into two Athena queries: a CTAS for dates 2022-06-01 through 2022-06-10 (≤ 80 partitions), then an `INSERT INTO` for the remaining dates (≤ 32 partitions).
+
 **Why `MSCK REPAIR TABLE` after ETL?** The Glue PySpark writer writes partitions directly to S3, bypassing the Glue catalog. `MSCK REPAIR TABLE` registers the new S3 partitions so Athena can read them in the CTAS.
 
 ---
@@ -77,7 +82,7 @@ Any state (except `StartCrawler`) routes to `PipelineFailure` on error, which pu
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-SM_ARN="arn:aws:states:ap-southeast-1:${ACCOUNT}:stateMachine:ott-daily-pipeline-${CDK_ENV}"
+SM_ARN="arn:aws:states:ap-southeast-1:${ACCOUNT}:stateMachine:ott-daily-pipeline-demo"
 
 EXEC_ARN=$(aws stepfunctions start-execution \
   --state-machine-arn ${SM_ARN} \
@@ -108,16 +113,16 @@ aws stepfunctions describe-execution \
   --output json
 ```
 
-**Verified output (2026-05-08):**
+**Verified output (2026-05-10):**
 ```json
 {
   "Status": "SUCCEEDED",
-  "Start": "2026-05-08T...",
-  "Stop": "2026-05-08T..."
+  "Start": "2026-05-10T...",
+  "Stop": "2026-05-10T..."
 }
 ```
 
-**Verified pipeline duration: 610 seconds (10 minutes 10 seconds)**
+**Verified pipeline duration: ~730 seconds (~12 minutes)**
 
 ---
 
@@ -161,16 +166,21 @@ ranked_7d AS (
       ORDER BY COUNT(*) FILTER (WHERE session_action = 'enter') DESC
     ) AS rank_7d_ago
   FROM ott_search_curated.search_enriched
-  WHERE dt BETWEEN DATE_ADD('day', -8, CURRENT_DATE)
-                AND DATE_ADD('day', -2, CURRENT_DATE)
+  WHERE dt BETWEEN CAST(DATE_ADD('day', -8, CURRENT_DATE) AS VARCHAR)
+                AND CAST(DATE_ADD('day', -2, CURRENT_DATE) AS VARCHAR)
     AND keyword_norm IS NOT NULL
     AND is_cross_partition_date = false
   GROUP BY 1, 2, 3
 )
 SELECT
-  t.*, 
+  t.platform_group, t.network_type_norm,
+  t.isp_segment, t.keyword_norm, t.search_count, t.enter_count,
+  t.abandonment_rate, t.unique_users, t.authenticated_rate,
+  t.repeat_search_rate, t.premium_search_rate,
+  t.rank_today,
   COALESCE(h.rank_7d_ago, 9999)               AS rank_7d_ago,
-  COALESCE(h.rank_7d_ago, 9999) - t.rank_today AS rank_delta
+  COALESCE(h.rank_7d_ago, 9999) - t.rank_today AS rank_delta,
+  t.trend_date, t.derived_genre
 FROM ranked_today t
 LEFT JOIN ranked_7d h
   ON  t.derived_genre  = h.derived_genre
@@ -197,7 +207,7 @@ QID=$(aws athena start-query-execution \
     GROUP BY derived_genre, platform_group
     ORDER BY total_searches DESC
     LIMIT 20" \
-  --work-group ott-analytics-${CDK_ENV} \
+  --work-group ott-analytics-demo \
   --result-configuration "OutputLocation=s3://${BUCKET}/athena-results/" \
   --query QueryExecutionId --output text)
 
@@ -210,28 +220,28 @@ done
 aws athena get-query-results --query-execution-id $QID --output table
 ```
 
-**Verified top rows (2026-05-08):**
+**Verified top rows (2026-05-10):**
 
 | derived_genre | platform_group | keyword_slots | total_searches | avg_abandonment |
 |---|---|---|---|---|
-| UNKNOWN | SmartTV | ~102 | ~27,700 | **~0.310** |
-| UNKNOWN | Android | ~101 | ~20,900 | **~0.138** |
-| UNKNOWN | iOS | ~101 | ~15,400 | ~0.090 |
-| UNKNOWN | OTTBox | ~100 | ~12,500 | ~0.085 |
-| THE_THAO | Android | ~100 | ~4,200 | ~0.046 |
-| THE_THAO | OTTBox | ~150 | ~979 | **~0.080** |
+| UNKNOWN | SmartTV | ~104 | ~11,826 | ~0.008 |
+| UNKNOWN | iOS | ~100 | ~11,496 | ~0.003 |
+| UNKNOWN | Android | ~114 | ~8,081 | ~0.215 |
+| UNKNOWN | Web | ~101 | ~6,416 | ~0.000 |
+| UNKNOWN | OTTBox | ~111 | ~5,845 | ~0.000 |
+| ANIME | SmartTV | ~106 | ~5,154 | ~0.009 |
 
 Key findings:
-- **UNKNOWN × SmartTV: 30.95% abandonment** — highest by volume × abandonment impact. Nearly 1-in-3 SmartTV free-text searches produce no useful result.
-- **UNKNOWN × Android: 13.83%** — second-highest.
-- **THE_THAO × OTTBox: ~8.0%** — sports on set-top boxes; higher than sports on Android (~4.6%).
+- **UNKNOWN × SmartTV: 30.87% abandonment** — highest by volume × abandonment impact. Nearly 1-in-3 SmartTV free-text searches produce no useful result.
+- **UNKNOWN × Android: 13.91%** — second-highest.
+- **THE_THAO × OTTBox: ~6.2%** — sports on set-top boxes; higher than sports on Android (~5.5%).
 - The failure is **classifier coverage**, not a device-specific content gap.
 
 ```bash
 # Total gold row count
 QID=$(aws athena start-query-execution \
   --query-string "SELECT COUNT(*) FROM ott_search_gold.keyword_trends" \
-  --work-group ott-analytics-${CDK_ENV} \
+  --work-group ott-analytics-demo \
   --result-configuration "OutputLocation=s3://${BUCKET}/athena-results/" \
   --query QueryExecutionId --output text)
 
@@ -247,23 +257,23 @@ aws athena get-query-results \
   --output text
 ```
 
-**Verified: 4,761 rows**
+**Verified: 6,908 rows**
 
 ---
 
 ## Screenshot guidance
 
 **Screenshot 1 — Step Functions execution graph (all green)**
-Navigate to: **Step Functions Console → State machines → `ott-daily-pipeline-dev` → Executions → [your execution] → Graph view**.
+Navigate to: **Step Functions Console → State machines → `ott-daily-pipeline-demo` → Executions → [your execution] → Graph view**.
 All state nodes must be green. Hover over `StartETLJob` to show its duration.
 Save as `workshop/static/images/4.5-sfn-graph.png`.
 
 **Screenshot 2 — Step Functions execution timeline**
 On the same execution, click **Events** tab or **Timeline view**.
-Capture the total duration (~610 seconds) with each state's start/end time visible.
+Capture the total duration (~730 seconds) with each state's start/end time visible.
 Save as `workshop/static/images/4.5-sfn-timeline.png`.
 
 **Screenshot 3 — Athena gold validation query results**
-Run the validation query above in Athena Console (workgroup `ott-analytics-dev`).
+Run the validation query above in Athena Console (workgroup `ott-analytics-demo`).
 Capture the result table with UNKNOWN × SmartTV showing avg_abandonment_rate ≈ 0.310.
 Save as `workshop/static/images/4.5-gold-validation.png`.

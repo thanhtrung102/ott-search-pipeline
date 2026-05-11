@@ -6,8 +6,8 @@ pre: "<b>4.3 </b>"
 
 ## What this deploys
 
-- **Glue Crawler** `raw-events-crawler-dev` — scans `s3://{bucket}/raw/events/`, registers partition schema into `ott_search_raw.events`
-- **Glue ETL job** `search-enrichment-job-dev` — PySpark Glue 4.0, G.1X, 10 DPU; transforms raw 12-column schema → curated 18-column schema
+- **Glue Crawler** `raw-events-crawler-demo` — scans `s3://{bucket}/raw/events/`, registers partition schema into `ott_search_raw.events`
+- **Glue ETL job** `search-enrichment-job-demo` — PySpark Glue 4.0, G.1X, 10 DPU; transforms raw 12-column schema → curated 18-column schema
 - **Glue Database** `ott_search_curated` — catalog for enriched output
 
 ---
@@ -48,11 +48,11 @@ echo "Assets uploaded"
 ## Run the crawler
 
 ```bash
-aws glue start-crawler --name raw-events-crawler-${CDK_ENV}
+aws glue start-crawler --name raw-events-crawler-demo
 
 # Poll until READY (~90 seconds)
 until [ "$(aws glue get-crawler \
-  --name raw-events-crawler-${CDK_ENV} \
+  --name raw-events-crawler-demo \
   --query 'Crawler.State' --output text)" = "READY" ]; do
   echo "Crawler running..."
   sleep 15
@@ -60,15 +60,18 @@ done
 echo "Crawler finished"
 ```
 
-Verify partition count:
+Verify the crawler ran successfully and registered at least one partition:
 ```bash
-aws glue get-partitions \
-  --database-name ott_search_raw \
-  --table-name events \
-  --query 'length(Partitions)' \
-  --output text
-# Expected: 14 (one per dt=2022-06-NN folder)
+aws glue get-crawler \
+  --name raw-events-crawler-demo \
+  --query 'Crawler.{State:State,LastCrawlStatus:LastCrawl.Status}' \
+  --output json
+# Expected: {"State": "READY", "LastCrawlStatus": "SUCCEEDED"}
 ```
+
+{{% notice note %}}
+`ott_search_raw.events` uses 4-level Hive partitioning (dt, hour, derived_genre, platform_group). The `get-partitions` API counts all (dt × hour × genre × platform) tuples — not just the 14 date prefixes. The Glue ETL reads from S3 directly and does not depend on catalog partition count; MSCK REPAIR (in Step Functions) registers the curated output partitions separately.
+{{% /notice %}}
 
 ---
 
@@ -76,7 +79,7 @@ aws glue get-partitions \
 
 ```bash
 aws glue start-job-run \
-  --job-name search-enrichment-job-${CDK_ENV} \
+  --job-name search-enrichment-job-demo \
   --arguments '{
     "--PUSH_DOWN_PREDICATE": "dt >= '\''2022-06-01'\''",
     "--S3_BUCKET": "'"${BUCKET}"'",
@@ -87,11 +90,11 @@ aws glue start-job-run \
 Monitor until complete:
 ```bash
 RUN_ID=$(aws glue get-job-runs \
-  --job-name search-enrichment-job-${CDK_ENV} \
+  --job-name search-enrichment-job-demo \
   --query 'JobRuns[0].Id' --output text)
 
 until [ "$(aws glue get-job-run \
-  --job-name search-enrichment-job-${CDK_ENV} \
+  --job-name search-enrichment-job-demo \
   --run-id ${RUN_ID} \
   --query 'JobRun.JobRunState' --output text)" != "RUNNING" ]; do
   echo "ETL running..."
@@ -99,17 +102,17 @@ until [ "$(aws glue get-job-run \
 done
 
 aws glue get-job-run \
-  --job-name search-enrichment-job-${CDK_ENV} \
+  --job-name search-enrichment-job-demo \
   --run-id ${RUN_ID} \
   --query '{State:JobRun.JobRunState,Duration:JobRun.ExecutionTime,DPU:JobRun.MaxCapacity}' \
   --output json
 ```
 
-**Verified output (2026-05-08):**
+**Verified output (2026-05-10):**
 ```json
 {
   "State": "SUCCEEDED",
-  "Duration": 260,
+  "Duration": 197,
   "DPU": 10.0
 }
 ```
@@ -144,11 +147,18 @@ The job transforms the 12-column raw schema into 18 curated columns:
 
 Three types were found in the June 2022 dataset, each handled differently:
 
-**Type 1 — Arabic-Indic numerals** (device locale bug):
+**Type 1 — Arabic-Indic numerals** (U+0660–U+0669, device locale bug):
 ```
 Input:  "٢٠٢٢-٠٦-٠١ ١٣:٥٧:٤٧.٦٤٧"
 Output: "2022-06-01 13:57:47.647"
 Fix:    str.translate() with 10-char mapping table
+```
+
+**Type 1b — Extended Arabic-Indic numerals** (U+06F0–U+06F9, Farsi/Urdu locale):
+```
+Input:  "۲۰۲۲-۰۶-۱۴ ۱۳:۰۴:۲۱.۶۲۱"
+Output: "2022-06-14 13:04:21.621"
+Fix:    str.translate() with extended 20-char mapping table (both ranges)
 ```
 
 **Type 2 — Buddhist Era year** (Thai locale, BE = CE + 543):
@@ -166,13 +176,14 @@ Output: (row dropped — year < 2015 filter)
 
 PySpark UDF:
 ```python
-_AR = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+# U+0660–0669 = Arabic-Indic; U+06F0–06F9 = Extended Arabic-Indic (Farsi/Urdu)
+_AR = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 @udf(StringType())
 def clean_datetime(dt_str: str) -> str | None:
     if dt_str is None:
         return None
-    s = dt_str.strip().translate(_AR)   # Type 1: Arabic-Indic
+    s = dt_str.strip().translate(_AR)   # Type 1/1b: Arabic-Indic + Extended Arabic-Indic
     if s.startswith("2565"):            # Type 2: Buddhist Era
         s = "2022" + s[4:]
     m = _DT_RE.match(s)
@@ -183,6 +194,8 @@ def clean_datetime(dt_str: str) -> str | None:
     return f"{date_p} {hh.zfill(2)}:{mm}:{ss}.{ms}"
 # Step 3: filter year(event_ts) < 2015 drops Type 3
 ```
+
+`spark.sql.legacy.timeParserPolicy` is set to `CORRECTED` so any string that survives the UDF but still cannot be parsed by Spark's ISO 8601 formatter is silently coerced to `null` instead of raising a `SparkUpgradeException`. This prevents corrupt datetimes from failing the entire Spark stage.
 
 ---
 
@@ -204,7 +217,7 @@ QID=$(aws athena start-query-execution \
       AND is_cross_partition_date = false
     GROUP BY derived_genre
     ORDER BY event_count DESC" \
-  --work-group ott-analytics-${CDK_ENV} \
+  --work-group ott-analytics-demo \
   --result-configuration "OutputLocation=s3://${BUCKET}/athena-results/" \
   --query QueryExecutionId --output text)
 
@@ -219,23 +232,23 @@ aws athena get-query-results \
   --output table
 ```
 
-**Verified output shape (2026-05-08):**
+**Verified output shape (2026-05-10):**
 
 | derived_genre | event_count | abandonment_rate |
 |---|---|---|
-| UNKNOWN | ~1,235,000 | ~0.145 |
-| ANIME | ~34,600 | ~0.091 |
-| NHAC | ~21,300 | ~0.025 |
-| THE_THAO | ~14,600 | ~0.072 |
-| TRUYEN_HINH | ~11,300 | ~0.125 |
-| PHIM_VIET | ~6,000 | ~0.090 |
-| PHIM_AU_MY | ~3,100 | ~0.066 |
-| PHIM_TRUNG | ~2,300 | ~0.018 |
+| UNKNOWN | ~925,600 | ~0.148 |
+| ANIME | ~29,100 | ~0.092 |
+| NHAC | ~13,300 | ~0.030 |
+| TRUYEN_HINH | ~8,600 | ~0.126 |
+| THE_THAO | ~8,200 | ~0.070 |
+| PHIM_VIET | ~4,200 | ~0.072 |
+| PHIM_AU_MY | ~1,900 | ~0.061 |
+| PHIM_TRUNG | ~1,800 | ~0.024 |
 
-Total valid curated records (verified): **1,333,242** (1,334,620 total minus cross-partition date rows).
+Total valid curated records (verified): **992,650** (0 cross-partition date rows in this single sequential replay).
 
 {{% notice note %}}
-UNKNOWN dominates because the rule-based LUT + regex covers ~44.5% of keyword volume. Free-text searches with no genre match (the long tail) fall to UNKNOWN. This is expected behavior, not a bug — it is an explicit acknowledgment of classifier uncertainty. The LLM fallback (`LLM_ENABLED=true`) handles the long tail in production but requires a Secrets Manager API key and is disabled in this demo.
+UNKNOWN dominates because the rule-based LUT + regex covers ~43.5% of keyword volume. Free-text searches with no genre match (the long tail) fall to UNKNOWN. This is expected behavior, not a bug — it is an explicit acknowledgment of classifier uncertainty. The LLM fallback (`LLM_ENABLED=true`) handles the long tail in production but requires a Secrets Manager API key and is disabled in this demo.
 {{% /notice %}}
 
 ---
@@ -254,11 +267,11 @@ Capture the Schema tab showing all 10 data columns and the Partition keys sectio
 Save as `workshop/static/images/4.3-glue-schema.png`.
 
 **Screenshot 2 — ETL job run SUCCEEDED**
-Navigate to: **Glue Console → ETL Jobs → `search-enrichment-job-dev` → Run history tab**.
-Capture the run detail showing **State: Succeeded**, execution time ≈260 seconds, DPU=10.
+Navigate to: **Glue Console → ETL Jobs → `search-enrichment-job-demo` → Run history tab**.
+Capture the run detail showing **State: Succeeded**, execution time ≈197 seconds, DPU=10.
 Save as `workshop/static/images/4.3-glue-run.png`.
 
 **Screenshot 3 — Athena curated validation query results**
-Navigate to: **Athena Console → Query editor** (workgroup `ott-analytics-dev`).
+Navigate to: **Athena Console → Query editor** (workgroup `ott-analytics-demo`).
 Run the validation query above. Capture all 8 genre rows with non-null abandonment_rate.
 Save as `workshop/static/images/4.3-curated-validation.png`.

@@ -125,6 +125,12 @@ class ETLStack(Stack):
         )
         if s3_key:
             s3_key.grant_encrypt_decrypt(etl_role)
+        etl_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:InvokeModel"],
+                resources=["*"],
+            )
+        )
 
         # Upload Glue script to S3 (uses CDK asset deployment approach via S3 ref)
         glue_script_location = (
@@ -174,7 +180,7 @@ class ETLStack(Stack):
                 "--S3_BUCKET": bucket_name,
                 "--CURATED_DB": "ott_search_curated",
                 "--RAW_DB": "ott_search_raw",
-                "--LLM_ENABLED": "false",
+                "--LLM_ENABLED": "true",
                 "--extra-py-files": (
                     f"s3://{bucket_name}/glue-scripts/genre_classifier.zip"
                 ),

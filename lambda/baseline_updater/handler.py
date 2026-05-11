@@ -7,7 +7,7 @@ Invoked in two modes:
 
 Queries Athena curated layer for 7-day rolling enter-event counts per
 (derived_genre, hour_of_day_vn) grouped by calendar day. Computes per-slot
-mean and std across days, then batch-writes 192 items (8 genres × 24 hours)
+mean and std across days, then batch-writes up to 216 items (9 genres × 24 hours)
 to DynamoDB ott-baseline-stats.
 
 DynamoDB item schema:

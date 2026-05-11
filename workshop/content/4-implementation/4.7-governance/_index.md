@@ -34,11 +34,11 @@ This stack disables the default IAM passthrough for the Glue Data Catalog (`Crea
 
 | Role | S3 access | Lake Formation | Columns visible |
 |---|---|---|---|
-| `ott-data-engineering-dev` | `raw/`, `curated/`, `gold/` | ALL on raw + curated + gold | All columns |
-| `ott-analyst-dev` | `curated/`, `gold/` | SELECT+DESCRIBE on curated + gold | All columns |
-| `ott-marketing-dev` | `gold/` only | SELECT on `gold.keyword_trends` (11 of 16 columns) | keyword_norm, search_count, enter_count, abandonment_rate, rank_today, rank_delta, trend_date, derived_genre, platform_group, network_type_norm, isp_segment |
+| `ott-data-engineering-demo` | `raw/`, `curated/`, `gold/` | ALL on raw + curated + gold | All columns |
+| `ott-analyst-demo` | `curated/`, `gold/` | SELECT+DESCRIBE on curated + gold | All columns |
+| `ott-marketing-demo` | `gold/` only | SELECT on `gold.keyword_trends` (11 of 16 columns) | keyword_norm, search_count, enter_count, abandonment_rate, rank_today, rank_delta, trend_date, derived_genre, platform_group, network_type_norm, isp_segment |
 
-**Excluded from `ott-marketing-dev`** (5 columns):
+**Excluded from `ott-marketing-demo`** (5 columns):
 - `unique_users` — re-identification risk via cross-join
 - `authenticated_rate` — reveals unauthenticated session ratio (operationally sensitive)
 - `repeat_search_rate` — individual behavioral signal
@@ -54,17 +54,21 @@ This stack disables the default IAM passthrough for the Glue Data Catalog (`Crea
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
-read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < <(
-  aws sts assume-role \
-    --role-arn "arn:aws:iam::${ACCOUNT}:role/ott-marketing-${CDK_ENV}" \
-    --role-session-name "governance-demo" \
-    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-    --output text
-)
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+# Parse credentials as JSON to avoid carriage-return issues on Windows/macOS
+eval $(aws sts assume-role \
+  --role-arn "arn:aws:iam::${ACCOUNT}:role/ott-marketing-${CDK_ENV}" \
+  --role-session-name "governance-demo" \
+  --query 'Credentials' \
+  --output json | python3 -c "
+import json,sys
+c=json.load(sys.stdin)
+print(f'export AWS_ACCESS_KEY_ID={c[\"AccessKeyId\"]}')
+print(f'export AWS_SECRET_ACCESS_KEY={c[\"SecretAccessKey\"]}')
+print(f'export AWS_SESSION_TOKEN={c[\"SessionToken\"]}')
+")
 
 aws sts get-caller-identity --query Arn --output text
-# Expected: arn:aws:sts::{account}:assumed-role/ott-marketing-dev/governance-demo
+# Expected: arn:aws:sts::{account}:assumed-role/ott-marketing-demo/governance-demo
 ```
 
 ### Step 2 — Query curated layer (MUST FAIL)
@@ -74,7 +78,7 @@ BUCKET_ORIG="ott-search-${ACCOUNT}-${CDK_ENV}"
 
 QID=$(aws athena start-query-execution \
   --query-string "SELECT user_id_hashed FROM ott_search_curated.search_enriched LIMIT 1" \
-  --work-group ott-analytics-${CDK_ENV} \
+  --work-group ott-analytics-demo \
   --result-configuration "OutputLocation=s3://${BUCKET_ORIG}/athena-results/marketing-test/" \
   --query QueryExecutionId --output text)
 
@@ -90,7 +94,7 @@ aws athena get-query-execution \
 ```json
 {
   "State": "FAILED",
-  "StateChangeReason": "PERMISSION_DENIED: User: arn:aws:sts::{account}:assumed-role/ott-marketing-dev/governance-demo is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::ott-search-{account}-dev/curated/search_enriched/...\" because no identity-based policy allows the s3:GetObject action"
+  "StateChangeReason": "PERMISSION_DENIED: User: arn:aws:sts::{account}:assumed-role/ott-marketing-demo/governance-demo is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::ott-search-{account}-demo/curated/search_enriched/...\" because no identity-based policy allows the s3:GetObject action"
 }
 ```
 
@@ -102,7 +106,7 @@ QID=$(aws athena start-query-execution \
                   FROM ott_search_gold.keyword_trends
                   WHERE derived_genre = 'THE_THAO'
                   ORDER BY search_count DESC LIMIT 5" \
-  --work-group ott-analytics-${CDK_ENV} \
+  --work-group ott-analytics-demo \
   --result-configuration "OutputLocation=s3://${BUCKET_ORIG}/athena-results/marketing-test/" \
   --query QueryExecutionId --output text)
 
@@ -114,7 +118,11 @@ aws athena get-query-results \
   --output json
 ```
 
-**Verified output:** 5 rows with `keyword_norm`, `abandonment_rate`, `rank_delta` values — no error. No `user_id_hashed`, `unique_users`, `premium_search_rate`, or `authenticated_rate` in results (Lake Formation column exclusion enforced).
+{{% notice warning %}}
+**Windows:** The `--output json` command above may fail with a `charmap` encoding error when results contain Vietnamese characters. This is an AWS CLI display issue on Windows. To verify the query succeeded, check the status separately: `aws athena get-query-execution --query-execution-id ${QID} --query 'QueryExecution.Status.State' --output text` — expected `SUCCEEDED`.
+{{% /notice %}}
+
+**Verified output (2026-05-10):** `SUCCEEDED` status. 5 rows with `keyword_norm`, `abandonment_rate`, `rank_delta` values — Vietnamese sports keywords. No `user_id_hashed`, `unique_users`, `premium_search_rate`, or `authenticated_rate` in results (Lake Formation column exclusion enforced). Rows may repeat the same keyword across different `trend_date` partitions — this is expected since the query does not filter by date.
 
 ### Step 4 — Restore credentials
 
@@ -131,7 +139,7 @@ The pipeline enables Macie with a custom identifier for Vietnamese phone numbers
 
 - **Custom identifier pattern:** `(0|\+84)[0-9]{9}` — matches Vietnamese mobile and landline formats
 - **Scan scope:** `s3://{bucket}/raw/events/` prefix (raw keyword data before hashing)
-- **Frequency:** Weekly (Monday), findings published to Macie console
+- **Frequency:** Every 15 minutes (findings published to Macie console)
 
 ```bash
 # Verify Macie is enabled
@@ -147,11 +155,11 @@ aws macie2 get-macie-session \
 
 | Resource | Name | Configuration |
 |---|---|---|
-| IAM Role | `ott-data-engineering-dev` | LF admin, ALL on raw/curated/gold |
-| IAM Role | `ott-analyst-dev` | SELECT+DESCRIBE on curated+gold |
-| IAM Role | `ott-marketing-dev` | SELECT on gold.keyword_trends (11/16 columns) |
+| IAM Role | `ott-data-engineering-demo` | LF admin, ALL on raw/curated/gold |
+| IAM Role | `ott-analyst-demo` | SELECT+DESCRIBE on curated+gold |
+| IAM Role | `ott-marketing-demo` | SELECT on gold.keyword_trends (11/16 columns) |
 | Lake Formation | Data Catalog settings | Default IAM passthrough disabled |
-| Amazon Macie | session | ENABLED, 15-min finding frequency |
+| Amazon Macie | session | ENABLED, FIFTEEN_MINUTES finding frequency |
 | Macie Custom Identifier | Vietnamese phone pattern | `(0|\+84)[0-9]{9}` |
 | Macie Classification Job | weekly scan | Scope: `raw/events/` prefix |
 
@@ -161,7 +169,7 @@ aws macie2 get-macie-session \
 
 **Screenshot 1 — Lake Formation permissions**
 Navigate to: **Lake Formation Console → Data permissions**.
-Filter by principal `ott-marketing-dev`. Capture the table showing the `ott_search_gold` DESCRIBE grant and `keyword_trends` SELECT grant.
+Filter by principal `ott-marketing-demo`. Capture the table showing the `ott_search_gold` DESCRIBE grant and `keyword_trends` SELECT grant.
 Save as `workshop/static/images/4.7-lf-permissions.png`.
 
 **Screenshot 2 — Failed Athena query (governance proof)**

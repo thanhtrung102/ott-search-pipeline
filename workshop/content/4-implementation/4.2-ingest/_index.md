@@ -26,12 +26,12 @@ cdk deploy OttIngestion-${CDK_ENV} \
 
 Expected terminal output:
 ```
-✅  OttIngestion-dev
+✅  OttIngestion-demo
 
 Outputs:
-OttIngestion-dev.StreamName = ott-search-stream-dev
-OttIngestion-dev.FirehoseName = ott-search-firehose-dev
-OttIngestion-dev.ReplayFunctionName = ott-replay-producer-dev
+OttIngestion-demo.StreamName = ott-search-stream-demo
+OttIngestion-demo.FirehoseName = ott-search-firehose-demo
+OttIngestion-demo.ReplayFunctionName = ott-replay-producer-demo
 ```
 
 ---
@@ -64,28 +64,32 @@ aws firehose describe-delivery-stream \
 
 ## Run the replay
 
-Upload the June 2022 dataset to S3 first (see Prerequisites, Step 9), then trigger all 14 daily folders concurrently:
+Upload the June 2022 dataset to S3 first (see Prerequisites, Step 9), then trigger all 14 daily folders **sequentially** (one at a time) to avoid Kinesis throttling:
 
 ```bash
 FN="ott-replay-producer-${CDK_ENV}"
 
 for day in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
-  cat > /tmp/payload_${day}.json <<EOF
-{"s3_prefix": "s3://${BUCKET}/raw-source/log_search/dt=2022-06-${day}"}
-EOF
+  echo "Replaying 202206${day}..."
   aws lambda invoke \
     --function-name ${FN} \
-    --invocation-type Event \
-    --payload fileb:///tmp/payload_${day}.json \
-    /tmp/response_${day}.json &
+    --invocation-type RequestResponse \
+    --cli-binary-format raw-in-base64-out \
+    --payload "{\"s3_prefix\": \"s3://${BUCKET}/raw-source/log_search/202206${day}\"}" \
+    --cli-read-timeout 960 \
+    /tmp/response_${day}.json
+  cat /tmp/response_${day}.json
 done
-wait
-echo "All 14 Lambda invocations dispatched"
+echo "All 14 days replayed"
 ```
 
-The 14 producers run concurrently against the 2-shard stream. Throttling is expected — the Lambda retries automatically via exponential backoff.
+Each day completes in ~1–2 minutes (SPEEDUP_FACTOR=100000, no rate pacing). Total ~18 minutes for 14 days.
 
-**Verified result (2026-05-08):** ~331,000 Kinesis records published from 1,146,996 source rows. The remainder of the source data reaches the curated layer via the Glue ETL in Section 4.3, which reads directly from source Parquet (not from Kinesis).
+{{% notice note %}}
+The raw-source directories are named `20220601/` through `20220614/` (YYYYMMDD format, no `dt=` prefix). Ensure this matches your dataset upload (see Prerequisites, Step 9).
+{{% /notice %}}
+
+**Verified result (2026-05-09):** 1,146,996 Kinesis records published from 1,146,996 source rows, 0 failed (sequential run, no throttling). All records flow through Kinesis → Firehose → `raw/events/`. The Glue ETL in Section 4.3 reads from `raw/events/` (Firehose output), not directly from raw-source.
 
 ---
 
@@ -115,7 +119,7 @@ aws cloudwatch get-metric-statistics \
   --statistics Sum \
   --query 'Datapoints[0].Sum' \
   --output text
-# Expected: ~331000
+# Expected: ~1,146,996 (full 14-day replay within the last 2 hours)
 ```
 
 ---
@@ -125,22 +129,15 @@ aws cloudwatch get-metric-statistics \
 To demonstrate the real-time anomaly detector, replay June 2 with a synthetic 10× sports spike at 20:00:
 
 ```bash
-cat > /tmp/payload_inject.json <<EOF
-{
-  "s3_prefix": "s3://${BUCKET}/raw-source/log_search/dt=2022-06-02",
-  "inject_anomaly": true,
-  "anomaly_genre": "THE_THAO",
-  "anomaly_hour": 20,
-  "anomaly_multiplier": 10
-}
-EOF
-
 aws lambda invoke \
   --function-name ${FN} \
-  --invocation-type Event \
-  --payload fileb:///tmp/payload_inject.json \
+  --invocation-type RequestResponse \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"s3_prefix": "s3://'"${BUCKET}"'/raw-source/log_search/20220602", "inject_anomaly": true, "anomaly_genre": "THE_THAO", "anomaly_hour": 20, "anomaly_multiplier": 10}' \
+  --cli-read-timeout 960 \
   /tmp/response_inject.json
-echo "Anomaly injection dispatched"
+cat /tmp/response_inject.json
+echo "Anomaly injection complete"
 ```
 
 ---
@@ -149,9 +146,9 @@ echo "Anomaly injection dispatched"
 
 | Resource | Name | Configuration |
 |---|---|---|
-| Kinesis Data Stream | `ott-search-stream-dev` | 2 shards, 24h retention, KMS SSE (`ott-kinesis-key`) |
-| Kinesis Firehose | `ott-search-firehose-dev` | JSON→Parquet SNAPPY, dynamic partitioning via JQ |
-| Lambda | `ott-replay-producer-dev` | 15 min timeout, 512 MB, `ott-lambda-sg` |
+| Kinesis Data Stream | `ott-search-stream-demo` | 2 shards, 24h retention, KMS SSE (`ott-kinesis-key`) |
+| Kinesis Firehose | `ott-search-firehose-demo` | JSON→Parquet SNAPPY, dynamic partitioning via JQ |
+| Lambda | `ott-replay-producer-demo` | 15 min timeout, 3008 MB, `ott-lambda-sg` |
 | Glue Database | `ott_search_raw` | Catalog for crawler output |
 
 Firehose dynamic partition JQ expression:
@@ -173,11 +170,11 @@ Firehose partitions on the raw `datetime` field (before datetime repair). Events
 ## Screenshot guidance
 
 **Screenshot 1 — Kinesis stream IncomingRecords**
-Navigate to: **Kinesis Console → Data Streams → `ott-search-stream-dev` → Monitoring tab**.
+Navigate to: **Kinesis Console → Data Streams → `ott-search-stream-demo` → Monitoring tab**.
 Set time range to the replay window. Capture the `IncomingRecords` metric showing the spike.
 Save as `workshop/static/images/4.2-kinesis.png`.
 
 **Screenshot 2 — S3 raw partition structure**
-Navigate to: **S3 Console → `ott-search-{account}-dev` → raw/events/**.
+Navigate to: **S3 Console → `ott-search-{account}-demo` → raw/events/**.
 Expand one date prefix to show `dt=.../hour=.../derived_genre=.../platform_group=.../` hierarchy.
 Save as `workshop/static/images/4.2-s3-raw.png`.

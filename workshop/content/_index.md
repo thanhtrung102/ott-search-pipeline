@@ -12,19 +12,19 @@ A dual-path AWS analytics pipeline for Vietnamese OTT search behavior — built 
 |---|---|
 | What is trending? | Top-50 keywords per genre × platform, with 7-day rank deltas, by 02:00 each morning |
 | Is something wrong right now? | Z-score alert within 5 minutes of a genre's search rate deviating ≥ 3σ |
-| Where is the search experience failing? | Abandonment rate heatmap — UNKNOWN × SmartTV at **30.95%** |
+| Where is the search experience failing? | Abandonment rate heatmap — UNKNOWN × SmartTV at **30.87%** |
 
-## Verified results (June 2022 dataset, run 2026-05-08)
+## Verified results (June 2022 dataset, run 2026-05-10)
 
 | Metric | Value |
 |---|---|
 | Source events | 1,146,996 (14 daily Parquet folders) |
-| Curated records | **1,334,620** total; **1,333,242** valid |
-| Gold keyword_trends rows | **4,761** |
+| Curated records | **992,650** valid (0 cross-partition date rows) |
+| Gold keyword_trends rows | **6,908** |
 | DynamoDB baseline slots | **192** (8 genres × 24 hours) |
-| DynamoDB anomaly events | **65,148** (65,051 DROP, 97 SPIKE) |
-| Step Functions pipeline duration | **10 minutes 10 seconds** |
-| Glue ETL duration | **260 seconds** (G.1X, 10 DPU) |
+| DynamoDB anomaly events | **69,306** (69,208 DROP, 98 SPIKE) |
+| Step Functions pipeline duration | **~12 minutes** |
+| Glue ETL duration | **~200 seconds** (G.1X, 10 DPU) |
 | Anomaly alert latency | **≤ 5 minutes** |
 | Demo cost | **~$9.60** |
 

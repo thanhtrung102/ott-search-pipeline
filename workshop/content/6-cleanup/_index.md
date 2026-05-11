@@ -147,9 +147,9 @@ aws kinesis describe-stream-summary \
 
 | Component | Cost |
 |---|---|
-| Kinesis Data Streams (2 shards, ~5 min replay) | ~$0.05 |
-| Kinesis Firehose (~331K records, JSON→Parquet) | ~$0.05 |
-| Glue ETL (10 DPU × G.1X × 260 s) | ~$0.32 |
+| Kinesis Data Streams (2 shards, ~18 min replay) | ~$0.05 |
+| Kinesis Firehose (~1.1M records, JSON→Parquet) | ~$0.05 |
+| Glue ETL (10 DPU × G.1X × ~200 s) | ~$0.32 |
 | Athena (CTAS + validation, ~2 GB scanned) | ~$0.01 |
 | Step Functions (1 execution) | ~$0.01 |
 | KMS (4 CMKs × API calls) | ~$0.02 |

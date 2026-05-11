@@ -30,15 +30,15 @@ cdk deploy OttNetwork-${CDK_ENV} OttStorage-${CDK_ENV} \
 
 Expected terminal output:
 ```
-✅  OttNetwork-dev
+✅  OttNetwork-demo
 
 Outputs:
-OttNetwork-dev.VpcId = vpc-xxxxxxxxxxxxxxxxx
+OttNetwork-demo.VpcId = vpc-xxxxxxxxxxxxxxxxx
 
-✅  OttStorage-dev
+✅  OttStorage-demo
 
 Outputs:
-OttStorage-dev.BucketName = ott-search-123456789012-dev
+OttStorage-demo.BucketName = ott-search-703668403514-demo
 ```
 
 ---
@@ -49,7 +49,7 @@ OttStorage-dev.BucketName = ott-search-123456789012-dev
 
 ```bash
 VPC_ID=$(aws ec2 describe-vpcs \
-  --filters "Name=tag:Name,Values=ott-vpc-${CDK_ENV}" \
+  --filters "Name=tag:aws:cloudformation:stack-name,Values=OttNetwork-${CDK_ENV}" \
   --query 'Vpcs[0].VpcId' --output text)
 echo "VPC: ${VPC_ID}"
 
@@ -61,16 +61,16 @@ aws ec2 describe-subnets \
 
 Expected:
 ```
---------------------------------------------------
-|  DescribeSubnets                               |
-+--------------------------+--------------------+
-|  Name                    |  CIDR              |
-+--------------------------+--------------------+
-|  ott-public-a-dev        |  10.0.101.0/24     |
-|  ott-public-b-dev        |  10.0.102.0/24     |
-|  ott-private-a-dev       |  10.0.1.0/24       |
-|  ott-private-b-dev       |  10.0.2.0/24       |
-+--------------------------+--------------------+
+-------------------------------------------------------------
+|                     DescribeSubnets                       |
++--------------------------------------+-------------------+
+|  Name                                |  CIDR             |
++--------------------------------------+-------------------+
+|  OttNetwork-demo/Vpc/PublicSubnet1   |  10.0.0.0/24      |
+|  OttNetwork-demo/Vpc/PublicSubnet2   |  10.0.1.0/24      |
+|  OttNetwork-demo/Vpc/PrivateSubnet1  |  10.0.2.0/24      |
+|  OttNetwork-demo/Vpc/PrivateSubnet2  |  10.0.3.0/24      |
++--------------------------------------+-------------------+
 ```
 
 ### VPC endpoints (13 total)
@@ -113,10 +113,10 @@ aws kms list-aliases \
 Expected:
 ```json
 [
-  "alias/ott-s3-key",
+  "alias/ott-dynamodb-key",
   "alias/ott-kinesis-key",
-  "alias/ott-sns-key",
-  "alias/ott-dynamodb-key"
+  "alias/ott-s3-key",
+  "alias/ott-sns-key"
 ]
 ```
 
@@ -142,7 +142,7 @@ aws cloudtrail describe-trails \
 
 Expected:
 ```json
-[{"Name": "ott-audit-trail-dev", "MultiRegion": true, "Validation": true}]
+[{"Name": "ott-search-trail", "MultiRegion": true, "Validation": true}]
 ```
 
 ### GuardDuty
@@ -164,16 +164,16 @@ Expected:
 
 | Stack | Resource | Name | Key config |
 |---|---|---|---|
-| OttNetwork | VPC | `ott-vpc-dev` | CIDR 10.0.0.0/16 |
-| OttNetwork | Subnets | public-a/b, private-a/b | Across 2 AZs |
+| OttNetwork | VPC | `OttNetwork-demo/Vpc` | CIDR 10.0.0.0/16 |
+| OttNetwork | Subnets | PublicSubnet1/2, PrivateSubnet1/2 | Across 2 AZs |
 | OttNetwork | VPC Endpoints | 13 endpoints | 2 Gateway, 11 Interface |
 | OttNetwork | Security Groups | glue, lambda, endpoints | No inbound; HTTPS egress to VPC CIDR only |
 | OttStorage | KMS CMK | `ott-s3-key` | Annual rotation, 7-day deletion window |
 | OttStorage | KMS CMK | `ott-kinesis-key` | Kinesis + Firehose |
 | OttStorage | KMS CMK | `ott-sns-key` | SNS anomaly topic |
 | OttStorage | KMS CMK | `ott-dynamodb-key` | DynamoDB tables |
-| OttStorage | S3 Bucket | `ott-search-{account}-dev` | SSE-KMS, versioning, CloudTrail logging |
-| OttStorage | CloudTrail | `ott-audit-trail-dev` | Multi-region, log file validation |
+| OttStorage | S3 Bucket | `ott-search-{account}-demo` | SSE-KMS, versioning, CloudTrail logging |
+| OttStorage | CloudTrail | `ott-search-trail` | Multi-region, log file validation |
 | OttStorage | GuardDuty | detector | ENABLED, 6-hour finding frequency |
 
 ---
@@ -181,11 +181,11 @@ Expected:
 ## Screenshot guidance
 
 **Screenshot 1 — VPC endpoints**
-Navigate to: **VPC Console → Endpoints** — filter by VPC `ott-vpc-dev`.
+Navigate to: **VPC Console → Endpoints** — filter by VPC `OttNetwork-demo/Vpc`.
 Capture all 13 endpoints with State: available.
 Save as `workshop/static/images/4.1-vpc-endpoints.png`.
 
 **Screenshot 2 — S3 bucket properties**
-Navigate to: **S3 Console → `ott-search-{account}-dev` → Properties tab**.
+Navigate to: **S3 Console → `ott-search-{account}-demo` → Properties tab**.
 Capture the Default encryption row showing `aws:kms` and Versioning row showing `Enabled`.
 Save as `workshop/static/images/4.1-s3.png`.

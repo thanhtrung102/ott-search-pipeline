@@ -8,7 +8,7 @@ pre: "<b>0. </b>"
 
 ## Overview
 
-FPT Play processes approximately 82,350 search events per day from Vietnamese OTT viewers. The raw event log exists in a data warehouse but refreshes once per day in batch — meaning a prime-time search failure at 20:00 is not visible until 08:00 the next morning. This proposal describes a dual-path AWS analytics pipeline that closes that gap: surfacing anomalies within 5 minutes and delivering keyword trend rankings by 02:00 each morning.
+FPT Play processes approximately 81,928 search events per day from Vietnamese OTT viewers. The raw event log exists in a data warehouse but refreshes once per day in batch — meaning a prime-time search failure at 20:00 is not visible until 08:00 the next morning. This proposal describes a dual-path AWS analytics pipeline that closes that gap: surfacing anomalies within 5 minutes and delivering keyword trend rankings by 02:00 each morning.
 
 The pipeline is built entirely as CDK Python, reproducible from a single `cdk deploy --all` command.
 
@@ -24,7 +24,7 @@ The Product Analytics team at FPT Play has three unanswered questions about thei
 | Is something wrong right now? | Unknown until user complaints arrive | Z-score alert within 5 minutes of a genre's search rate deviating ≥ 3σ |
 | Where is the search experience failing? | Cannot be answered from raw logs without manual querying | Abandonment rate heatmap by genre × platform, refreshed daily |
 
-The June 2022 dataset confirms this matters: SmartTV users searching for content that matches no known genre pattern are abandoning at **30.95%** — nearly one in three. The search index likely has the content; the classifier cannot map the free-text query to it. Without the pipeline, this signal is buried in 82,000 daily event rows that no business user can query.
+The June 2022 dataset confirms this matters: SmartTV users searching for content that matches no known genre pattern are abandoning at **30.87%** — nearly one in three. The search index likely has the content; the classifier cannot map the free-text query to it. Without the pipeline, this signal is buried in 82,000 daily event rows that no business user can query.
 
 ---
 
@@ -108,13 +108,13 @@ The pipeline was designed and built in 8 iterations over 8 weeks:
 
 ## Budget
 
-**Demo run (June 2022 dataset, 1.13M source records, verified 2026-05-08):**
+**Demo run (June 2022 dataset, 1.13M source records, verified 2026-05-10):**
 
 | Component | Cost |
 |---|---|
-| Kinesis Data Streams (2 shards, ~5 min replay) | ~$0.05 |
-| Kinesis Firehose (JSON→Parquet, ~331K records) | ~$0.05 |
-| Glue ETL job (10 DPU × G.1X × 260 sec) | $0.32 |
+| Kinesis Data Streams (2 shards, ~18 min replay) | ~$0.05 |
+| Kinesis Firehose (JSON→Parquet, ~1.1M records) | ~$0.05 |
+| Glue ETL job (10 DPU × G.1X × ~200 sec) | $0.32 |
 | Athena queries (CTAS + validation, ~2 GB scanned) | ~$0.01 |
 | Step Functions (1 execution, standard workflow) | ~$0.01 |
 | KMS (4 CMKs × API calls) | ~$0.02 |
@@ -129,7 +129,7 @@ The pipeline was designed and built in 8 iterations over 8 weeks:
 |---|---|
 | Kinesis Data Streams (2 shards) | ~$15 |
 | Kinesis Firehose | ~$3 |
-| Glue ETL (daily, 10 DPU × 260 sec) | ~$3 |
+| Glue ETL (daily, 10 DPU × ~200 sec) | ~$7 |
 | Step Functions (30 executions) | ~$1 |
 | DynamoDB (on-demand) | ~$1 |
 | Athena (~30 CTAS + queries) | ~$2 |
@@ -147,31 +147,31 @@ The pipeline was designed and built in 8 iterations over 8 weeks:
 
 ## Verified Results (June 2022 dataset)
 
-All metrics verified against the deployed `demo` environment on 2026-05-08:
+All metrics verified against the deployed `demo` environment on 2026-05-10:
 
 | Metric | Value |
 |---|---|
 | Source events | 1,146,996 (14 daily Parquet folders) |
-| Kinesis records published | ~331,000 (throttled: 2 shards × 14 concurrent Lambdas) |
+| Kinesis records published | 1,146,996 (sequential replay — no throttling) |
 | S3 raw partitions | 14 date × 24 hour × 8 genre × 5 platform |
-| Curated records after ETL | **1,334,620** total; **1,333,242** valid (cross-partition excluded) |
-| Gold keyword_trends rows | **4,761** (top-50 per genre × platform) |
+| Curated records after ETL | **992,650** valid (0 cross-partition date rows) |
+| Gold keyword_trends rows | **6,908** (top-50 per genre × platform, 14 dates) |
 | DynamoDB baseline slots | **192** (8 genres × 24 hours) |
-| DynamoDB anomaly events | **65,148** (65,051 DROP, 97 SPIKE) |
-| Step Functions pipeline duration | **10 minutes 10 seconds** |
-| Glue ETL duration | **260 seconds** (G.1X, 10 DPU) |
+| DynamoDB anomaly events | **69,306** (69,208 DROP, 98 SPIKE) |
+| Step Functions pipeline duration | **~12 minutes** |
+| Glue ETL duration | **~200 seconds** (G.1X, 10 DPU) |
 | Anomaly alert latency | **≤5 minutes** (z-score >3 → EventBridge → SNS) |
 
 **Key findings from the data:**
 
 | Finding | Detail |
 |---|---|
-| Highest abandonment | UNKNOWN × SmartTV: **30.95%** (362,253 events) |
-| Highest genre by volume | UNKNOWN: 1,239,982 events (93.3% of curated) |
-| Music keyword diversity | NHAC: 668 distinct keyword slots in gold layer |
-| Classifier coverage | 44.5% of keyword volume classified; 55.5% falls to UNKNOWN |
-| Sports abandonment | THE_THAO overall: **7.16%**; OTTBox: **8.01%** |
-| Pipeline reliability | DailyPipelineSuccess metric: 1 hit on 2026-05-08 |
+| Highest abandonment | UNKNOWN × SmartTV: **30.87%** (269,720 events) |
+| Highest genre by volume | UNKNOWN: 925,593 events (93.2% of curated) |
+| Music keyword diversity | NHAC: 392 distinct keyword slots in gold layer |
+| Classifier coverage | 43.5% of keyword volume classified; 56.5% falls to UNKNOWN |
+| Sports abandonment | THE_THAO overall: **7.02%**; OTTBox: **6.16%** |
+| Pipeline reliability | DailyPipelineSuccess metric: 1 hit on 2026-05-10 |
 
 ---
 
@@ -180,12 +180,12 @@ All metrics verified against the deployed `demo` environment on 2026-05-08:
 | Metric | Target | Verified result |
 |---|---|---|
 | Anomaly detection latency | ≤ 5 minutes | ✓ (EventBridge → SNS in seconds after z>3) |
-| Daily pipeline completion | By 02:00 UTC+7 | ✓ (10 min 10 sec total, scheduled 01:30) |
+| Daily pipeline completion | By 02:00 UTC+7 | ✓ (~12 minutes total, scheduled 01:30) |
 | Curated enrichment coverage | All 18 columns populated | ✓ (verified via Athena validation gate) |
 | Governance boundary | Marketing role cannot access curated layer | ✓ (IAM S3 scope + Lake Formation enforced) |
 | Infrastructure reproducibility | Single `cdk deploy --all` | ✓ (9 stacks, ~15 minutes, verified) |
-| Glue ETL runtime | < 10 minutes | ✓ (260 seconds) |
-| Gold layer keyword slots | ≥ 4,000 rows (top-50 × 8 genres × N platforms) | ✓ (4,761 rows) |
+| Glue ETL runtime | < 10 minutes | ✓ (~200 seconds) |
+| Gold layer keyword slots | ≥ 4,000 rows (top-50 × 8 genres × N platforms) | ✓ (6,908 rows) |
 
 ---
 

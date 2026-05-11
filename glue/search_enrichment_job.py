@@ -53,9 +53,14 @@ try:
     _PUSH_DOWN_PREDICATE = _pdp_args["PUSH_DOWN_PREDICATE"]
 except Exception:
     _PUSH_DOWN_PREDICATE = "dt >= date_format(date_sub(current_date(), 2), 'yyyy-MM-dd')"
+import logging as _logging
+logger      = _logging.getLogger(__name__)
 sc          = SparkContext()
 glueContext = GlueContext(sc)
 spark       = glueContext.spark_session
+# Belt-and-suspenders: return null for any remaining unparseable timestamp
+# rather than throwing (Spark 3.3 default is EXCEPTION).
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
 job         = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
@@ -68,7 +73,11 @@ CURATED_PATH = f"s3://{S3_BUCKET}/curated/search_enriched/"
 
 # ── Step 1/2: Datetime normalisation (§6.7) ───────────────────────────────────
 
-_AR = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_AR = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩"   # Arabic-Indic    U+0660–U+0669
+    "۰۱۲۳۴۵۶۷۸۹",  # Ext. Arabic-Indic U+06F0–U+06F9
+    "01234567890123456789"
+)
 
 
 import re as _re
@@ -136,70 +145,175 @@ def subscription_count_udf(plans) -> int | None:
     return len(plans)
 
 
-# ── LLM fallback (batch path only, §6.4 / ADR-07) ────────────────────────────
+# ── Bedrock fallback (batch path only, §6.4 / ADR-07) ────────────────────────
+
+_VALID_GENRES = frozenset({
+    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
+    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH", "UNKNOWN",
+})
+_GENRE_ALIAS = {
+    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
+    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
+    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
+    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
+    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
+    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
+    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
+    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
+    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
+    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
+}
+
+
+def _normalize_genre(v) -> str:
+    if not isinstance(v, str):
+        return "UNKNOWN"
+    u = v.upper().strip()
+    u = _GENRE_ALIAS.get(u, u)
+    return u if u in _VALID_GENRES else "UNKNOWN"
+
+
+def _load_lut_ext_from_s3(bucket: str, key: str) -> dict:
+    """Load lut_extended.json from S3; return {} on any error."""
+    import json
+    import boto3
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("Could not load lut_extended from s3://%s/%s: %s", bucket, key, exc)
+        return {}
+
 
 def _apply_llm_fallback(df):
-    """Call Gemini for rows where category_norm = 'UNKNOWN'. Batch of 20."""
-    # Collect distinct UNKNOWN keywords (bounded — long tail only)
-    unknown_kws = [
+    """Classify residual UNKNOWN keywords via Amazon Nova Micro.
+
+    Strategy (cost + reproducibility):
+    1. Load lut_extended.json from S3 (built offline by scripts/build_extended_lut.py).
+       Keywords already in lut_extended get zero LLM calls this run.
+    2. Classify only NEW unknown keywords (unseen in lut_extended) via Nova Micro.
+    3. Merge new classifications into lut_extended and write back to S3 so they
+       are free on subsequent runs (incremental, self-improving LUT).
+    """
+    import json, os, re, io
+    import boto3
+
+    bucket = S3_BUCKET
+    lut_ext_key = "glue-scripts/lut_extended.json"
+
+    # Load existing extended LUT from S3
+    lut_ext = _load_lut_ext_from_s3(bucket, lut_ext_key)
+    logger.info("lut_extended loaded: %d entries", len(lut_ext))
+
+    # Collect all distinct UNKNOWN keywords (top 2000 by frequency)
+    all_unknown = [
         r.keyword_norm
         for r in df.filter(
             (col("derived_genre") == "UNKNOWN") & col("keyword_norm").isNotNull()
-        ).select("keyword_norm").distinct().limit(2000).collect()
+        ).groupBy("keyword_norm").count().orderBy(F.desc("count")).limit(2000)
+        .select("keyword_norm").collect()
     ]
-    if not unknown_kws:
-        return df
+    # Only send keywords NOT already in lut_extended to Nova
+    new_kws = [kw for kw in all_unknown if kw not in lut_ext]
+    logger.info("UNKNOWN keywords: %d total, %d already in lut_ext, %d to classify",
+                len(all_unknown), len(all_unknown) - len(new_kws), len(new_kws))
 
-    # Build batches of 20 and call Gemini
-    import json, os
-    import google.generativeai as genai  # in Lambda layer / Glue extra lib
-
-    api_key = _get_secret("ott-gemini-api-key")  # from Secrets Manager
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    genres = [
-        "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG",
-        "PHIM_VIET", "PHIM_AU_MY", "TRUYEN_HINH", "UNKNOWN",
-    ]
     lut_updates: dict[str, str] = {}
-
-    for i in range(0, len(unknown_kws), 20):
-        batch = unknown_kws[i: i + 20]
-        prompt = (
-            "Classify each Vietnamese OTT search keyword into exactly one genre: "
-            f"{genres}. Return JSON only: {{\"keyword\": \"genre\"}}.\n"
-            "Keywords:\n" + "\n".join(batch)
+    if new_kws:
+        bedrock = boto3.client("bedrock-runtime", region_name="ap-southeast-1")
+        model_id = os.environ.get("BEDROCK_MODEL_ID", "apac.amazon.nova-micro-v1:0")
+        prompt_tmpl = (
+            "You are a genre classifier for FPT Play, a Vietnamese OTT platform.\n"
+            "Classify search keywords into genres. Most keywords are movie/drama titles or partial titles.\n"
+            "When a keyword looks like a drama/movie title, prefer a specific genre over UNKNOWN.\n"
+            "Genre rules:\n"
+            "- PHIM_HAN: Korean dramas/movies, K-drama titles, names like 'oh soo jae', 'jun', 'ji'\n"
+            "- PHIM_TRUNG: Chinese dramas/movies, C-drama titles, wuxia, xianxia\n"
+            "- PHIM_VIET: Vietnamese dramas/movies, local titles in Vietnamese\n"
+            "- PHIM_AU_MY: Hollywood/Western films and series\n"
+            "- ANIME: Japanese anime, manga titles\n"
+            "- THE_THAO: Sports (football, basketball, esports...)\n"
+            "- NHAC: Music, songs, music videos, concerts\n"
+            "- TRUYEN_HINH: TV channels, variety/reality shows, live broadcasts\n"
+            "- UNKNOWN: Only truly ambiguous (single chars, meta queries like 'voice search')\n"
+            "Output: JSON where KEYS=keywords, VALUES=genre codes.\n"
+            "Example: {{\"why her?\": \"PHIM_HAN\", \"fairy tail\": \"ANIME\", \"tấm cám\": \"PHIM_VIET\"}}\n"
+            "Return ONLY the JSON object.\nKeywords:\n{kws}"
         )
-        try:
-            resp = model.generate_content(prompt)
-            parsed = json.loads(resp.text)
-            lut_updates.update(parsed)
-        except Exception:
-            pass  # LLM errors degrade gracefully to UNKNOWN
+        def _sanitize_kw(kw: str) -> str:
+            return re.sub(r"[\x00-\x1f\x7f\\]", " ", kw).strip()
 
-    if not lut_updates:
+        errors = 0
+        for i in range(0, len(new_kws), 50):
+            batch = new_kws[i: i + 50]
+            batch_set = set(batch)
+            # Map sanitized → original to recover keys from Nova's response
+            san_to_orig = {}
+            for kw in batch:
+                s = _sanitize_kw(kw)
+                if s and s not in san_to_orig:
+                    san_to_orig[s] = kw
+            clean_batch = list(san_to_orig.keys())
+            try:
+                body = json.dumps({
+                    "messages": [{"role": "user", "content": [{"text": prompt_tmpl.format(kws=chr(10).join(clean_batch))}]}],
+                    "inferenceConfig": {"maxTokens": 1024, "temperature": 0},
+                })
+                resp = bedrock.invoke_model(
+                    modelId=model_id,
+                    contentType="application/json",
+                    accept="application/json",
+                    body=body,
+                )
+                raw = json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
+                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+                parsed = json.loads(cleaned)
+                # Detect and fix inverted {genre: keyword} responses
+                keys_are_genres = sum(1 for k in parsed if isinstance(k, str) and k.upper() in _VALID_GENRES)
+                if keys_are_genres / max(len(parsed), 1) > 0.5:
+                    parsed = {v: k for k, v in parsed.items() if isinstance(v, str)}
+                for k, v in parsed.items():
+                    orig = san_to_orig.get(k, k)
+                    genre = _normalize_genre(v)
+                    if orig in batch_set and genre != "UNKNOWN":
+                        lut_updates[orig] = genre
+            except Exception as exc:
+                errors += 1
+                logger.warning("LLM batch %d/%d failed: %s", i // 50 + 1, (len(new_kws) + 49) // 50, exc)
+        logger.info("Nova classified %d new keywords, %d batch errors", len(lut_updates), errors)
+
+        # Write updated lut_extended back to S3 (incremental growth)
+        if lut_updates:
+            merged = {**lut_ext, **lut_updates}
+            try:
+                s3 = boto3.client("s3")
+                s3.put_object(
+                    Bucket=bucket, Key=lut_ext_key,
+                    Body=json.dumps(merged, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                logger.info("lut_extended updated on S3: %d → %d entries", len(lut_ext), len(merged))
+            except Exception as exc:
+                logger.warning("Failed to write lut_extended back to S3: %s", exc)
+
+    # Combined broadcast: lut_ext + new classifications
+    combined = {**lut_ext, **lut_updates}
+    if not combined:
         return df
 
-    # Create a broadcast map and apply corrections
-    lut_bc = spark.sparkContext.broadcast(lut_updates)
+    combined_bc = spark.sparkContext.broadcast(combined)
 
     @udf(StringType())
-    def llm_genre_udf(kw: str, current_genre: str) -> str:
+    def lut_genre_udf(kw: str, current_genre: str) -> str:
         if current_genre != "UNKNOWN" or kw is None:
             return current_genre
-        return lut_bc.value.get(kw, "UNKNOWN")
+        return combined_bc.value.get(kw, "UNKNOWN")
 
     return df.withColumn(
         "derived_genre",
-        llm_genre_udf(col("keyword_norm"), col("derived_genre")),
+        lut_genre_udf(col("keyword_norm"), col("derived_genre")),
     )
-
-
-def _get_secret(secret_name: str) -> str:
-    import boto3
-    client = boto3.client("secretsmanager")
-    return client.get_secret_value(SecretId=secret_name)["SecretString"]
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
