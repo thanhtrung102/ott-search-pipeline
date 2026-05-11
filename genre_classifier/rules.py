@@ -136,6 +136,10 @@ def _preprocess(kw: str) -> str:
     return kw
 
 
+import os as _os
+# Set GENRE_CLASSIFIER_FAST=1 in Glue to skip stage 4b (Nova fallback covers it there).
+_FAST_MODE: bool = _os.environ.get("GENRE_CLASSIFIER_FAST", "0") == "1"
+
 # FastText model — optional Stage 3; degrades to UNKNOWN if unavailable
 try:
     from genre_classifier.fasttext_model import predict_genre as _ft_predict
@@ -189,8 +193,8 @@ def classify_keyword(keyword_norm: str | None) -> str:
             return LUT[matches[0]]
 
     # 4b. Fuzzy match against multi-word LUT_EXT subset (cutoff=0.92, length ≥8)
-    #     High cutoff prevents false positives across large key space.
-    if len(kw) >= 8 and " " in kw:
+    #     Skipped when GENRE_CLASSIFIER_FAST=1 (Glue batch path — Nova fallback covers it).
+    if len(kw) >= 8 and " " in kw and not _FAST_MODE:
         matches = _difflib.get_close_matches(kw, _LUT_EXT_FUZZY_KEYS, n=1, cutoff=0.92)
         if matches:
             return LUT_EXT[matches[0]]
