@@ -260,16 +260,13 @@ class IngestionStack(Stack):
                     ],
                 ),
                 s3_backup_mode="Disabled",
-                encryption_configuration=firehose.CfnDeliveryStream.EncryptionConfigurationProperty(
-                    kms_encryption_config=firehose.CfnDeliveryStream.KMSEncryptionConfigProperty(
-                        awskms_key_arn=(
-                            kinesis_key.key_arn if kinesis_key
-                            else cdk.Aws.NO_VALUE  # type: ignore[arg-type]
+                encryption_configuration=(
+                    firehose.CfnDeliveryStream.EncryptionConfigurationProperty(
+                        kms_encryption_config=firehose.CfnDeliveryStream.KMSEncryptionConfigProperty(
+                            awskms_key_arn=s3_key.key_arn
                         )
-                    ) if kinesis_key else firehose.CfnDeliveryStream.EncryptionConfigurationProperty(
-                        no_encryption_config="NoEncryption"
-                    )
-                ) if kinesis_key else None,
+                    ) if s3_key else None
+                ),
             ),
         )
 
@@ -313,9 +310,27 @@ class IngestionStack(Stack):
                             actions=["bedrock:InvokeModel"],
                             resources=["arn:aws:bedrock:ap-southeast-1::foundation-model/amazon.nova-micro-v1:0"],
                         ),
+                        # Decrypt S3 objects encrypted with bucket default KMS key.
+                        iam.PolicyStatement(
+                            actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                            resources=(
+                                [s3_key.key_arn] if s3_key
+                                else ["arn:aws:kms:::PLACEHOLDER"]
+                            ),
+                        ),
                     ]
                 )
             },
+        )
+
+        # Layer provides pyarrow + rapidfuzz + genre_classifier for Linux x86_64 (Python 3.11).
+        # Built from manylinux wheels and published as ott-pyarrow-rapidfuzz:2.
+        _deps_layer = _lambda.LayerVersion.from_layer_version_arn(
+            self, "DepsLayer",
+            layer_version_arn=(
+                f"arn:aws:lambda:{self.region}:{self.account}"
+                ":layer:ott-pyarrow-rapidfuzz:2"
+            ),
         )
 
         self._replay_fn = _lambda.Function(
@@ -327,6 +342,7 @@ class IngestionStack(Stack):
             memory_size=512,
             timeout=Duration.minutes(15),
             role=replay_role,
+            layers=[_deps_layer],
             environment={
                 "STREAM_NAME": self._stream.stream_name,
                 "SPEEDUP_FACTOR": "336",

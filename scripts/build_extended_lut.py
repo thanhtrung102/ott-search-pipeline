@@ -15,33 +15,15 @@ making reruns incremental (cost-free for already-classified entries).
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import time
+from pathlib import Path
 
 import boto3
 
-# ── Taxonomy ─────────────────────────────────────────────────────────────────
-
-VALID_GENRES = {
-    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
-    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH", "UNKNOWN",
-}
-
-ALIAS = {
-    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
-    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
-    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
-    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
-    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
-    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
-    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
-    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
-    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
-    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
-    "PHIM_THAI": "UNKNOWN",
-}
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from genre_classifier.rules import VALID_GENRES, normalize_genre  # noqa: E402
 
 PROMPT_SYSTEM = """\
 You are a genre classifier for FPT Play, a Vietnamese OTT streaming platform.
@@ -79,36 +61,23 @@ Keywords to classify:
 Return ONLY the JSON object, no explanation."""
 
 
-def normalize(v: str) -> str:
-    if not isinstance(v, str):
-        return "UNKNOWN"
-    u = v.upper().strip()
-    u = ALIAS.get(u, u)
-    return u if u in VALID_GENRES else "UNKNOWN"
+_SANITIZE_RE  = re.compile(r"[\x00-\x1f\x7f\\]")
+_CODEBLOCK_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 def _detect_and_fix_inverted(parsed: dict, batch_set: set) -> dict:
-    """If Nova returns {genre: keyword} instead of {keyword: genre}, flip it."""
     if not parsed:
         return parsed
-    # Check if most keys look like genre codes
     keys_are_genres = sum(1 for k in parsed if k.upper() in VALID_GENRES) / len(parsed)
     if keys_are_genres > 0.5:
-        # Inverted: {genre: keyword} → {keyword: genre}
         return {v: k for k, v in parsed.items() if isinstance(v, str)}
     return parsed
 
 
-def _sanitize_for_prompt(kw: str) -> str:
-    """Strip control chars and backslashes that break Nova's JSON output."""
-    return re.sub(r"[\x00-\x1f\x7f\\]", " ", kw).strip()
-
-
 def classify_batch(bedrock, model_id: str, batch: list[str]) -> dict[str, str]:
-    # Map sanitized → original so we can look up the original key in the result
     sanitized_to_orig: dict[str, str] = {}
     for kw in batch:
-        s = _sanitize_for_prompt(kw)
+        s = _SANITIZE_RE.sub(" ", kw).strip()
         if s and s not in sanitized_to_orig:
             sanitized_to_orig[s] = kw
     clean_batch = list(sanitized_to_orig.keys())
@@ -126,13 +95,12 @@ def classify_batch(bedrock, model_id: str, batch: list[str]) -> dict[str, str]:
             body=body,
         )
         raw = json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-        parsed = json.loads(cleaned)
+        parsed = json.loads(_CODEBLOCK_RE.sub("", raw.strip()))
         parsed = _detect_and_fix_inverted(parsed, set(clean_batch))
         result = {}
         for k, v in parsed.items():
             orig = sanitized_to_orig.get(k, k)
-            genre = normalize(v)
+            genre = normalize_genre(v)
             if orig in batch and genre != "UNKNOWN":
                 result[orig] = genre
         return result
@@ -152,12 +120,13 @@ def main():
     ap.add_argument("--model",     default="apac.amazon.nova-micro-v1:0")
     args = ap.parse_args()
 
-    # Load existing LUT (incremental reruns)
     existing: dict[str, str] = {}
-    if os.path.exists(args.output):
+    try:
         with open(args.output, encoding="utf-8") as f:
             existing = json.load(f)
         print(f"Loaded {len(existing)} existing entries from {args.output}")
+    except FileNotFoundError:
+        pass
 
     # Read input keywords
     keywords: list[str] = []
@@ -198,14 +167,10 @@ def main():
         json.dump(clean_lut, f, ensure_ascii=False, indent=2, sort_keys=True)
     print(f"\nWrote {len(clean_lut)} entries to {args.output}")
 
-    # Upload to S3 if requested
     if args.s3_upload:
-        import subprocess
-        subprocess.run(
-            ["aws", "s3", "cp", args.output, args.s3_upload,
-             "--region", args.region],
-            check=True,
-        )
+        _uri = args.s3_upload[len("s3://"):]
+        _bucket, _, _key = _uri.partition("/")
+        boto3.client("s3", region_name=args.region).upload_file(args.output, _bucket, _key)
         print(f"Uploaded to {args.s3_upload}")
 
 

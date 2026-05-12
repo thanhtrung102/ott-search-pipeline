@@ -29,12 +29,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from genre_classifier.rules import LUT, LUT_EXT, _COMPILED, _GENRE_ORDER, _preprocess  # noqa: E402
+from genre_classifier.rules import (  # noqa: E402
+    LUT, LUT_EXT, VALID_GENRES, _COMPILED, _GENRE_ORDER, _preprocess,
+)
 
-VALID_GENRES = {
-    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
-    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH",
-}
+# apply_eval_fixes never writes UNKNOWN to LUTs — filter it out at point of use
+_FIXABLE_GENRES = VALID_GENRES - {"UNKNOWN"}
 
 # Keywords where Nova is known to be wrong — skip even if volume is high
 _NOVA_SKIP = {
@@ -93,7 +93,7 @@ def plan_fixes(
         vol      = int(row["search_count"])
 
         # Never apply UNKNOWN as a "fix" — keeps the old label
-        if nova_g == "UNKNOWN" or nova_g not in VALID_GENRES:
+        if nova_g not in _FIXABLE_GENRES:
             continue
 
         if kw in _NOVA_SKIP or kw_prep in _NOVA_SKIP:
@@ -126,7 +126,7 @@ def print_plan(lut_fixes: dict, lut_ext_fixes: dict, lut: dict, lut_ext: dict):
         print(f"  {kw:<45} {old_g:>12} → {new_g}")
 
     print(f"\nlut_extended.json fixes: {len(lut_ext_fixes)}")
-    for kw, new_g in sorted(lut_ext_fixes.items(), key=lambda x: -1):
+    for kw, new_g in sorted(lut_ext_fixes.items(), key=lambda x: x[0]):
         old_g = lut_ext.get(kw, "?")
         if old_g != new_g:
             print(f"  {kw:<45} {old_g:>12} → {new_g}")

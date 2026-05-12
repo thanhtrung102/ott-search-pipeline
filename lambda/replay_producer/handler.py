@@ -23,24 +23,27 @@ Environment variables:
   LUT_EXT_S3_KEY         S3 key for lut_extended.json within PARQUET_S3_PREFIX's
                          bucket (default glue-scripts/lut_extended.json)
 """
+import io
 import json
 import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait
 from datetime import datetime, timezone
 
 import boto3
+from botocore.config import Config
 import pyarrow.parquet as pq
 
 # genre_classifier is deployed as a Lambda layer (see ingestion_stack.py).
 # During local testing, add the repo root to sys.path.
 try:
-    from genre_classifier.rules import classify_keyword, bucket_platform
+    from genre_classifier.rules import classify_keyword, bucket_platform, VALID_GENRES, normalize_genre
 except ImportError:
     import sys
     sys.path.insert(0, "/opt/python")   # Lambda layer path
-    from genre_classifier.rules import classify_keyword, bucket_platform  # type: ignore
+    from genre_classifier.rules import classify_keyword, bucket_platform, VALID_GENRES, normalize_genre  # type: ignore
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -50,7 +53,7 @@ SPEEDUP_FACTOR = float(os.environ.get("SPEEDUP_FACTOR", "336"))
 S3_PREFIX      = os.environ["PARQUET_S3_PREFIX"].rstrip("/")  # s3://bucket/key-prefix
 
 _KINESIS  = boto3.client("kinesis")
-_S3       = boto3.client("s3")
+_S3       = boto3.client("s3", config=Config(connect_timeout=5, read_timeout=30))
 
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
@@ -70,22 +73,6 @@ _BEDROCK = (
     if _NOVA_FALLBACK else None
 )
 
-_VALID_GENRES = frozenset({
-    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
-    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH", "UNKNOWN",
-})
-_GENRE_ALIAS = {
-    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
-    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
-    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
-    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
-    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
-    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
-    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
-    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
-    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
-    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
-}
 _NOVA_PROMPT = (
     "You are a genre classifier for FPT Play, a Vietnamese OTT platform.\n"
     "Classify search keywords into genres. Most keywords are movie/drama titles.\n"
@@ -97,14 +84,8 @@ _NOVA_PROMPT = (
     "- UNKNOWN: Only truly ambiguous (single chars, gibberish, meta-queries)\n"
     "Output: JSON {{keyword: genre}}. Return ONLY the JSON.\nKeywords:\n{kws}"
 )
-_SANITIZE_RE = re.compile(r"[\x00-\x1f\x7f\\]")
-
-
-def _normalize_genre(v: str) -> str:
-    if not isinstance(v, str):
-        return "UNKNOWN"
-    u = _GENRE_ALIAS.get(v.upper().strip(), v.upper().strip())
-    return u if u in _VALID_GENRES else "UNKNOWN"
+_SANITIZE_RE  = re.compile(r"[\x00-\x1f\x7f\\]")
+_CODEBLOCK_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 def _nova_classify_batch(keywords: list[str]) -> dict[str, str]:
@@ -129,16 +110,17 @@ def _nova_classify_batch(keywords: list[str]) -> dict[str, str]:
             body=body,
         )
         raw = json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
-        parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE))
-        # Detect and fix inverted {genre: keyword} responses from Nova
-        if parsed and sum(1 for k in parsed if isinstance(k, str) and k.upper() in _VALID_GENRES) / len(parsed) > 0.5:
+        parsed = json.loads(_CODEBLOCK_RE.sub("", raw.strip()))
+        if parsed and sum(1 for k in parsed if isinstance(k, str) and k.upper() in VALID_GENRES) / len(parsed) > 0.5:
             parsed = {v: k for k, v in parsed.items() if isinstance(v, str)}
         kw_set = set(keywords)
-        return {
-            san_to_orig.get(k, k): _normalize_genre(v)
-            for k, v in parsed.items()
-            if san_to_orig.get(k, k) in kw_set and _normalize_genre(v) != "UNKNOWN"
-        }
+        result = {}
+        for k, v in parsed.items():
+            orig = san_to_orig.get(k, k)
+            genre = normalize_genre(v)
+            if orig in kw_set and genre != "UNKNOWN":
+                result[orig] = genre
+        return result
     except Exception as exc:
         logger.warning("Nova batch classify failed: %s", exc)
         return {}
@@ -255,7 +237,6 @@ def _list_parquet_keys(bucket: str, prefix: str) -> list[str]:
 
 def _read_parquet_from_s3(bucket: str, key: str) -> list[dict]:
     """Stream a Parquet file from S3 and return rows as dicts."""
-    import io
     resp = _S3.get_object(Bucket=bucket, Key=key)
     table = pq.read_table(io.BytesIO(resp["Body"].read()))
     return table.to_pylist()
@@ -263,10 +244,17 @@ def _read_parquet_from_s3(bucket: str, key: str) -> list[dict]:
 
 # ── Enrichment ────────────────────────────────────────────────────────────────
 
+# Per-invocation cache: same keyword (very common in search logs) reuses the
+# classification result rather than re-running the regex/fuzzy waterfall.
+_kw_genre_cache: dict[str | None, str] = {}
+
+
 def _enrich_row(row: dict) -> dict:
-    dt_clean      = _clean_dt(row.get("datetime"))
-    kw_norm       = (row.get("keyword") or "").lower().strip() or None
-    category_norm = classify_keyword(kw_norm)
+    dt_clean = _clean_dt(row.get("datetime"))
+    kw_norm  = (row.get("keyword") or "").lower().strip() or None
+    if kw_norm not in _kw_genre_cache:
+        _kw_genre_cache[kw_norm] = classify_keyword(kw_norm)
+    category_norm = _kw_genre_cache[kw_norm]
     platform_grp  = bucket_platform(row.get("platform"))
 
     enriched = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
@@ -285,9 +273,9 @@ def _put_batch(records: list[dict]) -> int:
     kinesis_records = [
         {
             "Data": json.dumps(r, ensure_ascii=False).encode(),
-            "PartitionKey": r.get("derived_genre", "UNKNOWN"),
+            "PartitionKey": f"{r.get('derived_genre', 'UNKNOWN')}_{i % 100}",
         }
-        for r in records
+        for i, r in enumerate(records)
     ]
     resp = _KINESIS.put_records(
         StreamName=STREAM_NAME,
@@ -320,67 +308,77 @@ def lambda_handler(event: dict, context: object) -> dict:
     keys = _list_parquet_keys(bucket, prefix)
     logger.info("Found %d parquet files under s3://%s/%s", len(keys), bucket, prefix)
 
-    all_rows: list[dict] = []
-    for key in keys:
-        rows = _read_parquet_from_s3(bucket, key)
-        enriched = [_enrich_row(r) for r in rows]
-        all_rows.extend(enriched)
-    logger.info("Total rows after waterfall classify: %d", len(all_rows))
+    def _ts(r: dict) -> float:
+        return _parse_ts(_clean_dt(r.get("datetime"))) or 0.0
 
-    # Nova fallback: re-classify UNKNOWN rows in one batched pass
-    if _NOVA_FALLBACK:
-        before = sum(1 for r in all_rows if r.get("derived_genre") == "UNKNOWN")
-        all_rows = _apply_nova_fallback(all_rows)
-        after = sum(1 for r in all_rows if r.get("derived_genre") == "UNKNOWN")
-        logger.info("Nova fallback resolved %d UNKNOWN → classified (%d remaining)", before - after, after)
+    total_published = 0
+    total_failed    = 0
+    total_rows      = 0
+    spike_rows: list[dict] = []  # collected across all files for anomaly injection
+
+    # Process files one at a time: read → enrich → publish → free.
+    # This keeps peak memory to ~one file (~250 MB) instead of all 14 at once (~3.5 GB).
+    # Replay-timing sleep is omitted: the anomaly detector uses hour_of_day_vn from the
+    # event payload, not Kinesis arrival time, so wall-clock spacing has no effect on
+    # anomaly scores. Only the rate limiter (§4.5) is kept.
+    for file_idx, key in enumerate(keys):
+        logger.info("File %d/%d: %s", file_idx + 1, len(keys), key.split("/")[-1])
+        try:
+            raw = _read_parquet_from_s3(bucket, key)
+        except Exception as exc:
+            logger.warning("Skipped %s: %s", key, exc)
+            continue
+
+        file_rows = [_enrich_row(r) for r in raw]
+        raw = None  # release pyarrow memory before publishing
+
+        if inject:
+            for r in file_rows:
+                if r.get("derived_genre") == anomaly_genre and _vn_hour(r) == anomaly_hour:
+                    spike_rows.append(r)
+
+        file_rows.sort(key=_ts)
+        total_rows += len(file_rows)
+        logger.info("  %d rows enriched, publishing…", len(file_rows))
+
+        for batch_start in range(0, len(file_rows), _BATCH_SIZE):
+            batch = file_rows[batch_start: batch_start + _BATCH_SIZE]
+            t0 = time.time()
+            failed = _put_batch(batch)
+            total_published += len(batch) - failed
+            total_failed    += failed
+            time.sleep(max(0, _BATCH_SIZE / _MAX_REC_SEC - (time.time() - t0)))
+
+    logger.info(
+        "Base replay done: %d rows from %d files, %d published, %d failed",
+        total_rows, len(keys), total_published, total_failed,
+    )
+    logger.info("Unique kw classifications cached: %d", len(_kw_genre_cache))
+
+    # Nova fallback on any remaining UNKNOWNs is skipped in streaming mode
+    # (Nova requires all rows in memory). Enable separately if needed.
 
     if inject:
-        spike_rows = [
-            r for r in all_rows
-            if r.get("derived_genre") == anomaly_genre
-            and _vn_hour(r) == anomaly_hour
-        ]
         injected = spike_rows * (anomaly_mult - 1)
-        all_rows.extend(injected)
         logger.info(
             "Anomaly injection: %d spike rows × %d = %d extra records "
             "(genre=%s hour=%d)",
             len(spike_rows), anomaly_mult - 1, len(injected), anomaly_genre, anomaly_hour,
         )
-
-    def _ts(r: dict) -> float:
-        return _parse_ts(_clean_dt(r.get("datetime"))) or 0.0
-
-    all_rows.sort(key=_ts)
-    timestamps = [_ts(r) for r in all_rows]
-    min_ts = timestamps[0] if timestamps else 0.0
-    now_epoch = time.time()
-
-    total_published = 0
-    total_failed    = 0
-
-    for batch_start in range(0, len(all_rows), _BATCH_SIZE):
-        batch = all_rows[batch_start: batch_start + _BATCH_SIZE]
-
-        last_row_ts = timestamps[min(batch_start + _BATCH_SIZE - 1, len(timestamps) - 1)]
-        replay_ts   = now_epoch + (last_row_ts - min_ts) / SPEEDUP_FACTOR
-        sleep_sec   = replay_ts - time.time()
-        if sleep_sec > 0:
-            time.sleep(min(sleep_sec, 1.0))
-
-        t0 = time.time()
-        failed = _put_batch(batch)
-        total_published += len(batch) - failed
-        total_failed    += failed
-
-        elapsed = time.time() - t0
-        time.sleep(max(0, _BATCH_SIZE / _MAX_REC_SEC - elapsed))
+        injected.sort(key=_ts)
+        for batch_start in range(0, len(injected), _BATCH_SIZE):
+            batch = injected[batch_start: batch_start + _BATCH_SIZE]
+            t0 = time.time()
+            failed = _put_batch(batch)
+            total_published += len(batch) - failed
+            total_failed    += failed
+            time.sleep(max(0, _BATCH_SIZE / _MAX_REC_SEC - (time.time() - t0)))
 
     summary = {
         "files_processed": len(keys),
-        "rows_total": len(all_rows),
+        "rows_total":        total_rows + len(spike_rows) * (anomaly_mult - 1 if inject else 0),
         "records_published": total_published,
-        "records_failed": total_failed,
+        "records_failed":    total_failed,
     }
     logger.info("Replay complete: %s", summary)
     return summary

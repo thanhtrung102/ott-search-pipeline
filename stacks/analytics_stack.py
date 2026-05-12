@@ -9,7 +9,7 @@ Resources:
       StartCrawler → WaitCrawler → StartETL
       → RepairCuratedTable (MSCK REPAIR — registers partitions Athena can see)
       → DropGoldTable     (DROP TABLE IF EXISTS — makes CTAS idempotent)
-      → RunAthenaGoldCTAS → InvokeBaselineUpdater
+      → RunAthenaGoldCTAS → InsertGoldBatch2 → InvokeBaselineUpdater
       → PipelineSuccess / PipelineFailure
   Step Functions role : least-privilege (Glue, Athena, Lambda invoke, S3, CloudWatch)
 
@@ -20,6 +20,9 @@ CDK context overrides (cdk.json or --context):
   gold_date_filter   : Athena WHERE dt filter for CTAS and baseline updater.
                        Default: "dt >= date_add('day', -1, current_date)"
                        Demo:    "dt >= '2022-01-01'"
+  gold_split_date    : Splits gold queries into two batches to stay under 10 GB
+                       scan cap.  Batch 1 (CTAS) ≤ split date; batch 2 (INSERT) > split.
+                       Default: "2022-06-10"
 
 Cross-stack inputs:
   bucket  ← StorageStack
@@ -46,16 +49,9 @@ from constructs import Construct
 from stacks import tag_stack
 
 
-# Gold CTAS SQL (§6.3) — aligned to spec output contract
-_GOLD_CTAS_SQL = """
-CREATE TABLE ott_search_gold.keyword_trends
-WITH (
-  format = 'PARQUET',
-  parquet_compression = 'SNAPPY',
-  partitioned_by = ARRAY['trend_date', 'derived_genre'],
-  external_location = 's3://{bucket}/gold/keyword_trends/'
-) AS
-WITH ranked_today AS (
+# Shared CTE body reused by both gold SQL statements (§6.3).
+# Parameterised: {date_filter} for ranked_today, {extra_where} for the outer WHERE.
+_GOLD_SELECT_BODY = """WITH ranked_today AS (
   SELECT
     CAST(dt AS DATE)                                       AS trend_date,
     derived_genre,
@@ -110,7 +106,23 @@ LEFT JOIN ranked_7d h
   AND t.platform_group = h.platform_group
   AND t.keyword_norm   = h.keyword_norm
 WHERE t.rank_today <= 50
+  {extra_where}
 """
+
+# Gold CTAS SQL (§6.3) — batch 1: trend_date <= gold_split_date.
+# Splitting avoids the 10 GB Athena scan-cap per query on the full 14-day dataset.
+_GOLD_CTAS_SQL = """
+CREATE TABLE ott_search_gold.keyword_trends
+WITH (
+  format = 'PARQUET',
+  parquet_compression = 'SNAPPY',
+  partitioned_by = ARRAY['trend_date', 'derived_genre'],
+  external_location = 's3://{bucket}/gold/keyword_trends/'
+) AS
+""" + _GOLD_SELECT_BODY
+
+# Gold INSERT SQL (§6.3) — batch 2: trend_date > gold_split_date.
+_GOLD_INSERT_SQL = "\nINSERT INTO ott_search_gold.keyword_trends\n" + _GOLD_SELECT_BODY
 
 
 class AnalyticsStack(Stack):
@@ -137,6 +149,13 @@ class AnalyticsStack(Stack):
         _date_filter = (
             self.node.try_get_context("gold_date_filter")
             or "dt >= date_add('day', -1, current_date)"
+        )
+
+        # Split date keeps each Athena query under the 10 GB scan cap.
+        # Batch 1 (CTAS):   trend_date <= gold_split_date
+        # Batch 2 (INSERT):  trend_date >  gold_split_date
+        _gold_split_date = (
+            self.node.try_get_context("gold_split_date") or "2022-06-10"
         )
 
         # ── Glue gold database ────────────────────────────────────────────────
@@ -227,7 +246,15 @@ class AnalyticsStack(Stack):
         # transitions) are included.  from_chainable() only traverses CDK
         # .next() links and silently drops states referenced only by name in
         # CustomState JSON, causing MISSING_TRANSITION_TARGET validation errors.
-        gold_sql = _GOLD_CTAS_SQL.format(bucket=bucket_name, date_filter=_date_filter)
+        gold_sql = _GOLD_CTAS_SQL.format(
+            bucket=bucket_name,
+            date_filter=_date_filter,
+            extra_where=f"AND t.trend_date <= DATE '{_gold_split_date}'",
+        )
+        gold_insert_sql = _GOLD_INSERT_SQL.format(
+            date_filter=_date_filter,
+            extra_where=f"AND t.trend_date > DATE '{_gold_split_date}'",
+        )
         _crawler = crawler_name or "raw-events-crawler"
         _job     = enrichment_job_name or "search-enrichment-job"
         _updater = baseline_updater_arn or "ott-baseline-updater"
@@ -314,6 +341,21 @@ class AnalyticsStack(Stack):
                             "OutputLocation": f"s3://{bucket_name}/athena-results/",
                         },
                     },
+                    "ResultPath": None,
+                    "Next": "InsertGoldBatch2",
+                    "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailure"}],
+                },
+                "InsertGoldBatch2": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                    "Parameters": {
+                        "QueryString": gold_insert_sql,
+                        "WorkGroup": f"ott-analytics-{env_name}",
+                        "ResultConfiguration": {
+                            "OutputLocation": f"s3://{bucket_name}/athena-results/",
+                        },
+                    },
+                    "ResultPath": None,
                     "Next": "InvokeBaselineUpdater",
                     "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailure"}],
                 },

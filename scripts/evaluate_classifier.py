@@ -33,25 +33,9 @@ from pathlib import Path
 import boto3
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from genre_classifier.rules import VALID_GENRES, normalize_genre  # noqa: E402
 
-GENRES = [
-    "THE_THAO", "NHAC", "ANIME", "PHIM_HAN",
-    "PHIM_AU_MY", "PHIM_TRUNG", "PHIM_VIET", "TRUYEN_HINH", "UNKNOWN",
-]
-
-_VALID_GENRES = frozenset(GENRES)
-_GENRE_ALIAS = {
-    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
-    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
-    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
-    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
-    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
-    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
-    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
-    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
-    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
-    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
-}
+GENRES = sorted(VALID_GENRES)
 
 _NOVA_JUDGE_PROMPT = """\
 You are an expert genre classifier for FPT Play, a Vietnamese OTT platform.
@@ -80,14 +64,6 @@ Keywords:
 {keywords}"""
 
 _SANITIZE_RE = re.compile(r"[\x00-\x1f\x7f\\]")
-
-
-def _normalize(v: str) -> str:
-    if not isinstance(v, str):
-        return "UNKNOWN"
-    u = v.upper().strip()
-    u = _GENRE_ALIAS.get(u, u)
-    return u if u in _VALID_GENRES else "UNKNOWN"
 
 
 # ── Athena helpers ────────────────────────────────────────────────────────────
@@ -193,11 +169,11 @@ def nova_judge_batch(bedrock, model_id: str, keywords: list[str]) -> dict[str, s
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
         parsed = json.loads(cleaned)
         # Detect and fix inverted {genre: keyword} Nova responses
-        if parsed and sum(1 for k in parsed if isinstance(k, str) and k.upper() in _VALID_GENRES) / len(parsed) > 0.5:
+        if parsed and sum(1 for k in parsed if isinstance(k, str) and k.upper() in VALID_GENRES) / len(parsed) > 0.5:
             parsed = {v: k for k, v in parsed.items() if isinstance(v, str)}
         kw_set = set(keywords)
         return {
-            san_to_orig.get(k, k): _normalize(v)
+            san_to_orig.get(k, k): normalize_genre(v)
             for k, v in parsed.items()
             if san_to_orig.get(k, k) in kw_set
         }

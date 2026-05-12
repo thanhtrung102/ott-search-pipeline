@@ -52,6 +52,33 @@ def _load_json_from_pkg(filename: str) -> dict:
 LUT: dict[str, str] = _load_json_from_pkg("lut.json")
 LUT_EXT: dict[str, str] = _load_json_from_pkg("lut_extended.json")
 
+VALID_GENRES: frozenset[str] = frozenset({
+    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
+    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH", "UNKNOWN",
+})
+
+_GENRE_ALIAS: dict[str, str] = {
+    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
+    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
+    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
+    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
+    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
+    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
+    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
+    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
+    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
+    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
+}
+
+
+def normalize_genre(v: str) -> str:
+    """Normalise a raw LLM genre response to a canonical VALID_GENRES value."""
+    if not isinstance(v, str):
+        return "UNKNOWN"
+    u = v.upper().strip()
+    u = _GENRE_ALIAS.get(u, u)
+    return u if u in VALID_GENRES else "UNKNOWN"
+
 
 def _strip_diacritics(s: str) -> str:
     return "".join(

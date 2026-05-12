@@ -41,7 +41,7 @@ logger.setLevel(logging.INFO)
 BASELINE_TABLE   = os.environ.get("BASELINE_TABLE",   "ott-baseline-stats")
 ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP",  "ott-analytics")
 ATHENA_OUTPUT    = os.environ["ATHENA_OUTPUT"]
-CURATED_DB       = os.environ.get("CURATED_DATABASE",  "ott_search_curated")
+CURATED_DB       = os.environ.get("CURATED_DB",       "ott_search_curated")
 CURATED_TABLE    = os.environ.get("CURATED_TABLE",     "search_enriched")
 # Optional: override the 7-day window with a fixed start date (e.g., for demos
 # with historical data).  Set BASELINE_DATE_FROM to 'YYYY-MM-DD'.

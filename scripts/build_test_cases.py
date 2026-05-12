@@ -25,31 +25,14 @@ Usage:
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
-import boto3
-
-VALID_GENRES = {
-    "NHAC", "THE_THAO", "ANIME", "PHIM_TRUNG", "PHIM_VIET",
-    "PHIM_AU_MY", "PHIM_HAN", "TRUYEN_HINH", "UNKNOWN",
-}
-
-_GENRE_ALIAS = {
-    "PHIM_CHINA": "PHIM_TRUNG", "PHIM_CHINESE": "PHIM_TRUNG",
-    "PHIM_TQ": "PHIM_TRUNG", "PHIM_TRUNG_QUOC": "PHIM_TRUNG",
-    "PHIM_CHIEU_RAP": "PHIM_AU_MY",
-    "PHIM_KOREAN": "PHIM_HAN", "PHIM_KOREA": "PHIM_HAN",
-    "KDRAMA": "PHIM_HAN", "K_DRAMA": "PHIM_HAN", "K-DRAMA": "PHIM_HAN",
-    "PHIM_JAPAN": "ANIME", "PHIM_NHAT": "ANIME", "MANGA": "ANIME",
-    "CARTOON": "ANIME", "HOAT_HINH": "ANIME",
-    "KPOP": "NHAC", "K_POP": "NHAC", "K-POP": "NHAC",
-    "VARIETY": "TRUYEN_HINH", "SHOW": "TRUYEN_HINH",
-    "PHIM_BO": "PHIM_VIET", "PHIM_LE": "PHIM_VIET",
-}
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from genre_classifier.rules import VALID_GENRES, normalize_genre  # noqa: E402
 
 _ADJUDICATE_PROMPT = """\
 You are an expert at classifying Vietnamese OTT (FPT Play) search keywords into genres.
@@ -72,18 +55,11 @@ Keywords:
 {items}"""
 
 _SANITIZE_RE = re.compile(r"[\x00-\x1f\x7f\\]")
-
-
-def _normalize(v: str) -> str:
-    if not isinstance(v, str):
-        return "UNKNOWN"
-    u = v.upper().strip()
-    u = _GENRE_ALIAS.get(u, u)
-    return u if u in VALID_GENRES else "UNKNOWN"
+_CODEBLOCK_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
 def _parse_response(raw: str, san_to_orig: dict, kw_set: set) -> dict[str, str]:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = _CODEBLOCK_RE.sub("", raw.strip())
     parsed  = json.loads(cleaned)
     if parsed and (
         sum(1 for k in parsed if isinstance(k, str) and k.upper() in VALID_GENRES)
@@ -91,7 +67,7 @@ def _parse_response(raw: str, san_to_orig: dict, kw_set: set) -> dict[str, str]:
     ):
         parsed = {v: k for k, v in parsed.items() if isinstance(v, str)}
     return {
-        san_to_orig.get(k, k): _normalize(v)
+        san_to_orig.get(k, k): normalize_genre(v)
         for k, v in parsed.items()
         if san_to_orig.get(k, k) in kw_set
     }
@@ -134,25 +110,24 @@ def _call_bedrock(bedrock, model_id: str, prompt: str,
 
 def _adjudicate_batch(client, model_id: str, provider: str,
                       disputes: list[dict]) -> dict[str, str]:
-    """Single-pass adjudication with the given provider/model."""
     san_to_orig: dict[str, str] = {}
     lines: list[str] = []
+    kw_set: set[str] = set()
     for d in disputes:
         kw = d["keyword_norm"]
+        kw_set.add(kw)
         s = _SANITIZE_RE.sub(" ", kw).strip()
         if s:
             san_to_orig.setdefault(s, kw)
             lines.append(f"{s}  |  {d['rules_genre']}  |  {d['nova_genre']}")
 
-    prompt  = _ADJUDICATE_PROMPT.format(items="\n".join(lines))
-    kw_set  = {d["keyword_norm"] for d in disputes}
+    prompt = _ADJUDICATE_PROMPT.format(items="\n".join(lines))
 
     if provider == "anthropic":
         result = _call_anthropic(client, model_id, prompt, san_to_orig, kw_set)
     else:
         result = _call_bedrock(client, model_id, prompt, san_to_orig, kw_set)
 
-    # Fill missing with rules_genre fallback
     rules_map = {d["keyword_norm"]: d["rules_genre"] for d in disputes}
     return {kw: result.get(kw, rules_map[kw]) for kw in kw_set}
 
@@ -160,12 +135,13 @@ def _adjudicate_batch(client, model_id: str, provider: str,
 def adjudicate_all(client, model_id: str, provider: str,
                    disputes: list[dict],
                    cache_path: str, batch_size: int) -> dict[str, str]:
-    """Adjudicate all disputed keywords; load/save cache."""
     cache: dict[str, str] = {}
-    if os.path.exists(cache_path):
+    try:
         with open(cache_path, encoding="utf-8") as f:
             cache = json.load(f)
         print(f"Loaded {len(cache):,} cached adjudications from {cache_path}")
+    except FileNotFoundError:
+        pass
 
     new   = [d for d in disputes if d["keyword_norm"] not in cache]
     total = (len(new) + batch_size - 1) // batch_size
@@ -179,7 +155,8 @@ def adjudicate_all(client, model_id: str, provider: str,
         batch_num = i // batch_size + 1
         if batch_num % 5 == 0 or batch_num == total:
             print(f"  [{batch_num}/{total}]  {min(i + batch_size, len(new))}/{len(new)}")
-        time.sleep(0.3)
+        if i + batch_size < len(new):
+            time.sleep(0.3)
 
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -187,11 +164,7 @@ def adjudicate_all(client, model_id: str, provider: str,
     return cache
 
 
-def build(report_path: str, adj_cache: dict[str, str]) -> list[dict]:
-    """Merge agree rows + adjudicated disputes into test case list."""
-    with open(report_path, encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-
+def build(rows: list[dict], adj_cache: dict[str, str]) -> list[dict]:
     cases: list[dict] = []
     for row in rows:
         kw    = row["keyword_norm"]
@@ -199,67 +172,65 @@ def build(report_path: str, adj_cache: dict[str, str]) -> list[dict]:
         agree = row["agree"] == "True"
 
         if agree:
-            cases.append({
-                "keyword_norm":   kw,
-                "expected_genre": row["rules_genre"],
-                "search_count":   cnt,
-                "confidence":     "high",
-                "source":         "agree",
-            })
+            confidence, source, genre = "high", "agree", row["rules_genre"]
         else:
             genre = adj_cache.get(kw)
             if not genre or genre not in VALID_GENRES:
-                genre = row["rules_genre"]  # fallback
-            cases.append({
-                "keyword_norm":   kw,
-                "expected_genre": genre,
-                "search_count":   cnt,
-                "confidence":     "adjudicated",
-                "source":         "haiku",
-            })
+                genre = row["rules_genre"]
+            confidence, source = "adjudicated", "haiku"
+
+        cases.append({
+            "keyword_norm":   kw,
+            "expected_genre": genre,
+            "search_count":   cnt,
+            "confidence":     confidence,
+            "source":         source,
+        })
 
     cases.sort(key=lambda x: -x["search_count"])
     return cases
 
 
 def print_summary(cases: list[dict]) -> None:
-    from collections import Counter
     total     = len(cases)
     high      = sum(1 for c in cases if c["confidence"] == "high")
-    adj       = total - high
     total_vol = sum(c["search_count"] for c in cases)
+
+    genre_count: Counter[str] = Counter()
+    genre_vol:   dict[str, int] = {}
+    for c in cases:
+        g = c["expected_genre"]
+        genre_count[g] += 1
+        genre_vol[g] = genre_vol.get(g, 0) + c["search_count"]
 
     print(f"\n{'═'*60}")
     print(f"  TEST SET SUMMARY")
     print(f"{'═'*60}")
     print(f"  Total test cases   : {total:,}")
     print(f"    High-confidence  : {high:,}  ({high/total*100:.1f}%)")
-    print(f"    Haiku-adjudicated: {adj:,}  ({adj/total*100:.1f}%)")
+    print(f"    Haiku-adjudicated: {total-high:,}  ({(total-high)/total*100:.1f}%)")
     print(f"  Total search volume: {total_vol:,}")
 
-    dist = Counter(c["expected_genre"] for c in cases)
     print(f"\n  Genre distribution:")
-    for g, cnt in sorted(dist.items(), key=lambda x: -x[1]):
-        vol = sum(c["search_count"] for c in cases if c["expected_genre"] == g)
-        print(f"    {g:<14} {cnt:>5,} keywords   {vol:>9,} searches")
+    for g, cnt in sorted(genre_count.items(), key=lambda x: -x[1]):
+        print(f"    {g:<14} {cnt:>5,} keywords   {genre_vol[g]:>9,} searches")
     print(f"{'═'*60}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--report",  default="C:/tmp/eval_report_v2.csv")
-    ap.add_argument("--cache",   default="C:/tmp/adjudication_cache.json")
-    ap.add_argument("--out",     default="tests/test_cases.json")
+    ap.add_argument("--report",   default="C:/tmp/eval_report_v2.csv")
+    ap.add_argument("--cache",    default="C:/tmp/adjudication_cache.json")
+    ap.add_argument("--out",      default="tests/test_cases.json")
     ap.add_argument("--model",    default="claude-sonnet-4-6")
     ap.add_argument("--provider", default="anthropic",
                     choices=["anthropic", "bedrock"],
                     help="anthropic = Anthropic API (ANTHROPIC_API_KEY); "
                          "bedrock = AWS Bedrock (uses --region)")
-    ap.add_argument("--batch",   type=int, default=40)
-    ap.add_argument("--region",  default="ap-southeast-1")
+    ap.add_argument("--batch",    type=int, default=40)
+    ap.add_argument("--region",   default="ap-southeast-1")
     args = ap.parse_args()
 
-    # Load disputes
     with open(args.report, encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
     disputes = [
@@ -275,13 +246,14 @@ def main():
         import anthropic as _anthropic
         client = _anthropic.Anthropic()
     else:
+        import boto3
         client = boto3.client("bedrock-runtime", region_name=args.region)
 
     adj_cache = adjudicate_all(
         client, args.model, args.provider, disputes, args.cache, args.batch
     )
 
-    cases = build(args.report, adj_cache)
+    cases = build(rows, adj_cache)
     print_summary(cases)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
